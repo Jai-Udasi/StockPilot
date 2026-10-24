@@ -37,7 +37,9 @@ For a production frontend build, run `npm run build`. Start the API with `npm st
 - Product names, SKUs, and prices are snapshotted on order items. Products with order or stock-movement history cannot be deleted, preserving the history.
 - Dashboard summaries include on-hand inventory value, units, current-month orders and sales, recent orders, and low-stock alerts.
 - Request bodies are validated and invalid input, duplicate SKUs, missing records, insufficient stock, and database errors receive explicit API error responses.
-- Responsive dashboard, product catalog, stock-update dialog, order composer, and mobile navigation.
+- Responsive, API-connected workspace with dashboard, product inventory, categories, suppliers, customers, sales orders, purchase orders, goods receipts, stock movements, invoices, payments, returns, and refunds.
+- Connected dialogs submit real API mutations, show validation/network errors, and refresh affected lists. Order and receipt quantities, invoice balances, return eligibility, and refund eligibility are sourced from persisted backend records.
+- Paginated transaction lists, search and filters where supported by the APIs, status-aware actions, confirmation dialogs for consequential transitions, and responsive mobile navigation.
 
 ## REST API
 
