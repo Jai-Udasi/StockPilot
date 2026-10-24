@@ -636,6 +636,98 @@ describe('Core business data APIs', () => {
     assert.equal(updated.body.product.unitCost, 5);
   });
 
+  it('updates product metadata with nullable fields and keeps quantity changes reconciled', async () => {
+    const category = (await client.post('/api/categories').send({ name: 'Update Category' })).body.category;
+    const supplier = await createSupplier({ supplierCode: 'SUP-UPDATE' });
+    const duplicate = await createProduct({ sku: 'OTHER-UPDATE' });
+    const product = await createProduct({
+      sku: 'UPDATE-ME',
+      categoryId: category.id,
+      supplierId: supplier.id,
+      description: 'Original description',
+      unitCost: 4.5,
+      maxStock: 30,
+      unitOfMeasure: 'box',
+    });
+    const updated = await client.put(`/api/products/${product.id}`).send({
+      sku: 'UPDATED-SKU',
+      name: 'Updated product',
+      category: 'Updated category',
+      price: 32.5,
+      quantity: 13,
+      lowStockThreshold: 4,
+      description: null,
+      categoryId: null,
+      supplierId: null,
+      unitCost: null,
+      maxStock: null,
+      unitOfMeasure: null,
+      isActive: false,
+    });
+    assert.equal(updated.status, 200);
+    assert.deepEqual({
+      sku: updated.body.product.sku,
+      name: updated.body.product.name,
+      category: updated.body.product.category,
+      price: updated.body.product.price,
+      quantity: updated.body.product.quantity,
+      lowStockThreshold: updated.body.product.lowStockThreshold,
+      description: updated.body.product.description,
+      categoryId: updated.body.product.categoryId,
+      supplierId: updated.body.product.supplierId,
+      unitCost: updated.body.product.unitCost,
+      maxStock: updated.body.product.maxStock,
+      unitOfMeasure: updated.body.product.unitOfMeasure,
+      isActive: updated.body.product.isActive,
+    }, {
+      sku: 'UPDATED-SKU',
+      name: 'Updated product',
+      category: 'Updated category',
+      price: 32.5,
+      quantity: 13,
+      lowStockThreshold: 4,
+      description: null,
+      categoryId: null,
+      supplierId: null,
+      unitCost: null,
+      maxStock: null,
+      unitOfMeasure: null,
+      isActive: false,
+    });
+
+    const movement = db.prepare(`
+      SELECT movement_type, quantity_delta, previous_quantity, new_quantity
+      FROM stock_movements WHERE product_id = ? ORDER BY id DESC LIMIT 1
+    `).get(product.id);
+    assert.deepEqual(movement, {
+      movement_type: 'adjustment',
+      quantity_delta: 3,
+      previous_quantity: 10,
+      new_quantity: 13,
+    });
+    assert.equal(getStockReconciliationReport(db).find((row) => row.id === product.id).reconciled, 1);
+
+    const invalidPrice = await client.put(`/api/products/${product.id}`).send({ price: -1 });
+    assert.equal(invalidPrice.status, 400);
+    const invalidQuantity = await client.put(`/api/products/${product.id}`).send({ quantity: -1 });
+    assert.equal(invalidQuantity.status, 400);
+    const invalidCategory = await client.put(`/api/products/${product.id}`).send({ categoryId: 99999 });
+    assert.equal(invalidCategory.status, 400);
+    const invalidSupplier = await client.put(`/api/products/${product.id}`).send({ supplierId: 99999 });
+    assert.equal(invalidSupplier.status, 400);
+    const duplicateSku = await client.put(`/api/products/${product.id}`).send({ sku: duplicate.sku });
+    assert.equal(duplicateSku.status, 409);
+    const responseOnlyFields = await client.put(`/api/products/${product.id}`).send({
+      id: product.id,
+      createdAt: product.createdAt,
+      updatedAt: product.updatedAt,
+      price: 35,
+    });
+    assert.equal(responseOnlyFields.status, 400);
+    assert.equal((await client.get(`/api/products/${product.id}`)).body.product.price, 32.5);
+    assert.equal((await client.get(`/api/products/${product.id}`)).body.product.quantity, 13);
+  });
+
   it('records authorized stock adjustments, rejects negative stock, and exposes immutable history', async () => {
     const product = await createProduct({ sku: 'LEDGER-01', quantity: 5 });
     const denied = await request(createApp({ db, authorizeStockAdjustment: () => false })).post(`/api/products/${product.id}/stock-adjustments`).send({
