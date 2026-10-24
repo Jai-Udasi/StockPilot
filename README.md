@@ -33,6 +33,7 @@ For a production frontend build, run `npm run build`. Start the API with `npm st
 - Stock changes are recorded in a movement ledger. Product creation, product stock edits, legacy stock updates, and sales all write their stock movements in the same SQLite transaction as the stock update.
 - Create sales orders with multiple products and either a walk-in customer or a linked customer. The compatibility `POST /orders` endpoint creates a confirmed order and deducts stock immediately, atomically. Draft orders are available through `POST /orders/drafts`; stock is deducted once on confirmation.
 - Manage draft purchase orders, submit them to suppliers, and receive partial or complete deliveries in multiple immutable receipt records. Stock increases only when goods are received; each receipt and stock-ledger update commits as one transaction.
+- Create immutable sales invoice snapshots, record partial/full business payments, accept quantity-bounded sales returns, and track requested/completed/failed refunds. Eligible restockable returns update inventory through the stock ledger transactionally.
 - Product names, SKUs, and prices are snapshotted on order items. Products with order or stock-movement history cannot be deleted, preserving the history.
 - Dashboard summaries include on-hand inventory value, units, current-month orders and sales, recent orders, and low-stock alerts.
 - Request bodies are validated and invalid input, duplicate SKUs, missing records, insufficient stock, and database errors receive explicit API error responses.
@@ -76,6 +77,24 @@ All endpoints are prefixed with `/api`. Successful responses use JSON except `DE
 | `POST` | `/orders/drafts` | Create a draft sales order without deducting stock |
 | `PUT` | `/orders/:id` | Edit a draft sales order |
 | `PATCH` | `/orders/:id/status` | Transition a sales order through its lifecycle |
+| `POST` | `/invoices` | Create a draft invoice snapshot from an eligible sales order |
+| `GET` | `/invoices` | Paginate/filter invoices by status, customer, and invoice date |
+| `GET` | `/invoices/:id` | Retrieve invoice lines, financial balance, payments, and returns |
+| `POST` | `/invoices/:id/issue` | Issue a draft invoice; its commercial snapshot becomes immutable |
+| `POST` | `/invoices/:id/void` | Void an unpaid invoice without active returns/refunds |
+| `POST` | `/invoices/:id/payments` | Record a completed or failed partial/full payment |
+| `GET` | `/payments` | Paginate/filter payments by invoice, status, and date |
+| `GET` | `/payments/:id` | Retrieve a payment record |
+| `POST` | `/payments/:id/reverse` | Reverse a completed payment that has no requested/completed refund |
+| `POST` | `/returns` | Create a draft return against a sale, optionally linked to its invoice |
+| `GET` | `/returns` | Paginate/filter returns by order, invoice, status, and date |
+| `GET` | `/returns/:id` | Retrieve return lines and refund history |
+| `POST` | `/returns/:id/complete` | Accept or reject a draft return; acceptance may restock through the ledger |
+| `POST` | `/returns/:id/refunds` | Request a refund against an accepted invoiced return and completed payment |
+| `GET` | `/refunds` | Paginate/filter refunds by invoice, return, and status |
+| `GET` | `/refunds/:id` | Retrieve a refund record |
+| `POST` | `/refunds/:id/complete` | Mark a requested refund completed |
+| `POST` | `/refunds/:id/fail` | Mark a requested refund failed |
 | `POST` | `/purchase-orders` | Create a draft purchase order |
 | `GET` | `/purchase-orders` | Filter/paginate by status, supplier, and date |
 | `GET` | `/purchase-orders/:id` | Get purchase lines and receipt history |
@@ -162,6 +181,90 @@ Purchase unit cost, line discounts, tax, and totals are persisted as integer cen
 
 Prices are represented as numeric dollar amounts in the API and stored as integer cents in SQLite to avoid floating-point rounding in order totals.
 
+### Invoices, payments, returns, and refunds
+
+Migration v6 adds invoices and invoice-line snapshots, payments, sales returns and return lines, and refunds. It preserves prior rows and uses foreign keys, uniqueness constraints, indexes, status checks, and immutability/transition triggers. Existing orders are not retroactively invoiced or assigned fictitious payment data.
+
+Create an invoice from a confirmed or later non-cancelled sale. Draft sales orders and cancelled orders are not eligible. Only one non-void invoice can exist for an order at a time; an invoice number is unique. Voiding an invoice is terminal and allows a replacement invoice for the same order. The invoice snapshots customer billing details and order-line product names, SKUs, quantities, and prices. Issuing freezes the financial snapshot. Legacy sales order lines contain no discount or tax breakdown, so invoice discounts and taxes are zero; this API is not a tax-compliance calculation.
+
+Example invoice creation and issue:
+
+```http
+POST /api/invoices
+Content-Type: application/json
+```
+
+```json
+{ "orderId": 1, "invoiceNumber": "INV-2026-001", "dueDate": "2026-11-01T00:00:00.000Z" }
+```
+
+The response contains a `draft` invoice and snapshotted lines. Issue it with `POST /api/invoices/{id}/issue`. Invoice statuses are `draft`, `issued`, `partially_paid`, `paid`, `credited`, and `void`; the API only permits issuing a draft, voiding an unpaid invoice without active return/refund activity, and financial status changes derived from persisted payments and accepted return credits.
+
+Record full, partial, or failed payments:
+
+```http
+POST /api/invoices/1/payments
+Content-Type: application/json
+```
+
+```json
+{ "amount": 25.50, "method": "card", "externalReference": "processor-ref-123", "status": "completed" }
+```
+
+Payment `amount` is a positive dollar amount converted to integer cents. A server-generated payment reference is returned when none is supplied. Duplicate payment or external transaction references and payments above the remaining balance are rejected. Failed payments do not count as collected money. Completed payments can be reversed only if no refund is requested or completed against them; reversal removes that amount from collected payments and recalculates the invoice balance. `POST /api/payments/{id}/reverse` performs that transition.
+
+The API reports these persisted invoice values:
+
+- `completedPayments`: sum of payments currently in `completed` status.
+- `acceptedReturnCredits`: value of accepted return lines linked to the invoice.
+- `outstandingBalance`: `max(0, invoice total - completed payments - accepted return credits)`.
+- `completedRefunds`: sum of refunds in `completed` status.
+- `unsettledReturnCredit`: `max(0, accepted return credits - completed refunds)`.
+- `netCashRetained`: `completed payments - completed refunds`.
+- `paymentStatus`: `unpaid`, `partial`, `paid`, `credited`, or `void`, derived from persisted invoice activity.
+
+Failed and reversed payments and requested/failed refunds are excluded from completed cash totals. Refunds settle accepted return credits and reduce `netCashRetained`; they do not create a new customer receivable after the return credit has already reduced the outstanding collectible balance. Returned-item credit is based on the snapshotted sold unit price and quantity; the legacy order model has no sale-tax or discount details to prorate.
+
+Create and accept a return:
+
+```http
+POST /api/returns
+Content-Type: application/json
+```
+
+```json
+{
+  "orderId": 1,
+  "invoiceId": 1,
+  "reason": "Customer returned damaged item",
+  "items": [
+    {
+      "orderItemId": 1,
+      "quantity": 1,
+      "restockable": false,
+      "restockReason": "Item is damaged and cannot be resold"
+    }
+  ]
+}
+```
+
+Returns start as `draft`; complete them with `POST /api/returns/{id}/complete` and `{ "status": "accepted" }` or `{ "status": "rejected" }`. Draft and accepted returns reserve sold quantities so concurrent/repeated requests cannot return more than was sold. Rejected returns release that reservation. Acceptance is atomic: each restockable line adds stock through one `return_in` ledger movement, while non-restockable lines do not affect stock. A failed movement rolls back the whole acceptance. Returns against cancelled sales are rejected, and an order cannot be cancelled while a non-void invoice or non-rejected return exists, preventing cancellation and returns from restoring the same units.
+
+Request a refund only for an accepted, invoice-linked return and a completed payment on that invoice:
+
+```http
+POST /api/returns/1/refunds
+Content-Type: application/json
+```
+
+```json
+{ "paymentId": 1, "amount": 10, "method": "card", "externalReference": "refund-ref-456" }
+```
+
+Refunds start as `requested`; use `POST /api/refunds/{id}/complete` or `/fail` to finalize the record. Multiple refunds are allowed only up to both the accepted return's remaining credit and the selected payment's unrefunded amount. Only completed refunds count as returned cash. A payment with a requested/completed refund cannot be reversed.
+
+These payment and refund records are business records only: there is no payment gateway, bank verification, accounting ledger, multi-currency support, tax compliance, or application-wide authentication in this phase.
+
 Manual adjustment requires the `Authorization: Bearer <token>` header. Configure `STOCK_ADJUSTMENT_TOKEN` before starting the API; if it is unset, the authorized adjustment endpoint denies requests. Example request:
 
 ```json
@@ -181,6 +284,52 @@ npm test
 ```
 
 The tests use isolated SQLite databases and verify product CRUD and validation, business-data APIs, migrations and seeding, purchase drafting/submission/receiving, sales lifecycle transitions, stock-ledger updates and reconciliation, transaction rollback, low-stock/dashboard summaries, and protected historical records.
+
+## Manual financial API smoke check
+
+To avoid using the normal development database, start the API with a dedicated temporary database path in one PowerShell terminal:
+
+```powershell
+$env:DATABASE_PATH = Join-Path $env:TEMP "stockpilot-phase4a-manual.db"
+npm run dev:api
+```
+
+In a second PowerShell terminal, use a seeded in-stock product to create a sale and invoice, record a payment, accept a restockable return, and request a refund:
+
+```powershell
+$base = "http://localhost:3001/api"
+$product = (Invoke-RestMethod "$base/products").products | Where-Object { $_.quantity -gt 0 } | Select-Object -First 1
+$order = Invoke-RestMethod -Method Post -Uri "$base/orders" -ContentType "application/json" -Body (@{
+  items = @(@{ productId = $product.id; quantity = 1 })
+} | ConvertTo-Json -Depth 5)
+$invoiceDraft = Invoke-RestMethod -Method Post -Uri "$base/invoices" -ContentType "application/json" -Body (@{
+  orderId = $order.order.id
+} | ConvertTo-Json)
+$invoice = Invoke-RestMethod -Method Post -Uri "$base/invoices/$($invoiceDraft.invoice.id)/issue" -ContentType "application/json" -Body "{}"
+$payment = Invoke-RestMethod -Method Post -Uri "$base/invoices/$($invoice.invoice.id)/payments" -ContentType "application/json" -Body (@{
+  amount = $invoice.invoice.total; method = "manual-test"
+} | ConvertTo-Json)
+$salesOrder = Invoke-RestMethod "$base/orders/$($order.order.id)"
+$return = Invoke-RestMethod -Method Post -Uri "$base/returns" -ContentType "application/json" -Body (@{
+  orderId = $order.order.id
+  invoiceId = $invoice.invoice.id
+  reason = "Manual API verification"
+  items = @(@{
+    orderItemId = $salesOrder.order.items[0].orderItemId
+    quantity = 1
+    restockable = $true
+    restockReason = "Inspected and suitable for resale"
+  })
+} | ConvertTo-Json -Depth 5)
+$acceptedReturn = Invoke-RestMethod -Method Post -Uri "$base/returns/$($return.salesReturn.id)/complete" -ContentType "application/json" -Body '{"status":"accepted"}'
+$refund = Invoke-RestMethod -Method Post -Uri "$base/returns/$($return.salesReturn.id)/refunds" -ContentType "application/json" -Body (@{
+  paymentId = $payment.payment.id; amount = $invoice.invoice.total; method = "manual-test"
+} | ConvertTo-Json)
+Invoke-RestMethod -Method Post -Uri "$base/refunds/$($refund.refund.id)/complete" -ContentType "application/json" -Body "{}"
+Invoke-RestMethod "$base/invoices/$($invoice.invoice.id)"
+```
+
+The invoice detail response provides persisted payment, refund, return-credit, outstanding-balance, and net-cash figures. The temporary database remains at the selected path; no existing database is reset or removed.
 
 ## Project structure
 

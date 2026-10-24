@@ -1,5 +1,6 @@
 import express from 'express';
 import cors from 'cors';
+import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { createDatabase, ledgerStockMovement } from './database.js';
 
@@ -114,6 +115,48 @@ const salesDraftSchema = orderSchema;
 const salesStatusSchema = z.object({
   status: z.enum(['confirmed', 'processing', 'shipped', 'delivered', 'cancelled']),
 }).strict();
+const invoiceCreateSchema = z.object({
+  orderId: z.number().int().positive(),
+  invoiceNumber: z.string().trim().min(1).max(80).optional(),
+  invoiceDate: z.string().datetime().optional(),
+  dueDate: z.string().datetime().nullable().optional(),
+}).strict();
+const paymentCreateSchema = z.object({
+  paymentReference: z.string().trim().min(1).max(80).optional(),
+  externalReference: z.string().trim().min(1).max(160).nullable().optional(),
+  amount: z.number().finite().positive().max(1_000_000_000),
+  method: z.string().trim().min(1).max(80),
+  status: z.enum(['completed', 'failed']).default('completed'),
+  paymentDate: z.string().datetime().optional(),
+  notes: z.string().trim().max(2000).nullable().optional(),
+}).strict();
+const returnCreateSchema = z.object({
+  returnNumber: z.string().trim().min(1).max(80).optional(),
+  orderId: z.number().int().positive(),
+  invoiceId: z.number().int().positive().nullable().optional(),
+  returnDate: z.string().datetime().optional(),
+  reason: z.string().trim().min(3).max(500),
+  items: z.array(z.object({
+    orderItemId: z.number().int().positive(),
+    quantity: z.number().int().positive().max(2_147_483_647),
+    restockable: z.boolean(),
+    restockReason: z.string().trim().min(3).max(500),
+  }).strict()).min(1).max(100).refine(
+    (items) => new Set(items.map((item) => item.orderItemId)).size === items.length,
+    { message: 'Each sold order line can only appear once per return.' },
+  ),
+}).strict();
+const returnCompleteSchema = z.object({
+  status: z.enum(['accepted', 'rejected']),
+}).strict();
+const refundCreateSchema = z.object({
+  refundReference: z.string().trim().min(1).max(80).optional(),
+  paymentId: z.number().int().positive(),
+  amount: z.number().finite().positive().max(1_000_000_000),
+  method: z.string().trim().min(1).max(80),
+  externalReference: z.string().trim().min(1).max(160).nullable().optional(),
+  notes: z.string().trim().max(2000).nullable().optional(),
+}).strict();
 
 function validate(schema, input) {
   const result = schema.safeParse(input);
@@ -135,6 +178,29 @@ function parseId(value, label = 'Product') {
   const id = Number(value);
   if (!Number.isSafeInteger(id) || id < 1) throw notFound(`${label} not found.`);
   return id;
+}
+
+function conflictOnUnique(action, message) {
+  try {
+    return action();
+  } catch (error) {
+    if (error.code === 'SQLITE_CONSTRAINT_UNIQUE') {
+      const conflict = new Error(message);
+      conflict.status = 409;
+      throw conflict;
+    }
+    throw error;
+  }
+}
+
+function moneyToMinorUnits(amount, label = 'Amount') {
+  const minorUnits = Math.round((amount + Number.EPSILON) * 100);
+  if (!Number.isSafeInteger(minorUnits) || minorUnits <= 0) {
+    const error = new Error(`${label} must be at least one cent.`);
+    error.status = 400;
+    throw error;
+  }
+  return minorUnits;
 }
 
 function mapProduct(row) {
@@ -242,12 +308,222 @@ function mapOrder(row, items) {
     updatedAt: row.updated_at ?? row.created_at,
     stockDeductedAt: row.stock_deducted_at ?? (row.status === 'draft' ? null : row.created_at),
     items: items.map((item) => ({
+      orderItemId: item.id,
       productId: item.product_id,
       productName: item.product_name,
       sku: item.sku,
       quantity: item.quantity,
       unitPrice: item.unit_price / 100,
     })),
+  };
+}
+
+function mapInvoiceItem(item) {
+  return {
+    id: item.id,
+    orderItemId: item.order_item_id,
+    productId: item.product_id,
+    productName: item.product_name,
+    sku: item.sku,
+    quantity: item.quantity,
+    unitPrice: item.unit_price / 100,
+    subtotal: item.subtotal / 100,
+    discountAmount: item.discount_amount / 100,
+    taxAmount: item.tax_amount / 100,
+    total: item.total / 100,
+  };
+}
+
+function getInvoiceFinancials(db, invoice) {
+  const completedPayments = db.prepare(`
+    SELECT COALESCE(SUM(amount), 0) AS amount FROM payments
+    WHERE invoice_id = ? AND status = 'completed'
+  `).get(invoice.id).amount;
+  const completedRefunds = db.prepare(`
+    SELECT COALESCE(SUM(amount), 0) AS amount FROM refunds
+    WHERE invoice_id = ? AND status = 'completed'
+  `).get(invoice.id).amount;
+  const acceptedReturnCredits = db.prepare(`
+    SELECT COALESCE(SUM(sri.refund_eligible_amount), 0) AS amount
+    FROM sales_return_items sri
+    JOIN sales_returns sr ON sr.id = sri.return_id
+    WHERE sr.invoice_id = ? AND sr.status = 'accepted'
+  `).get(invoice.id).amount;
+  const outstandingBalance = Math.max(0, invoice.total - acceptedReturnCredits - completedPayments);
+  const netCashRetained = completedPayments - completedRefunds;
+  return {
+    completedPayments,
+    completedRefunds,
+    acceptedReturnCredits,
+    outstandingBalance,
+    netCashRetained,
+  };
+}
+
+function updateInvoiceFinancialStatus(db, invoiceId) {
+  const invoice = db.prepare('SELECT * FROM invoices WHERE id = ?').get(invoiceId);
+  if (!invoice || invoice.status === 'draft' || invoice.status === 'void') return;
+  const financials = getInvoiceFinancials(db, invoice);
+  let status = 'issued';
+  if (financials.acceptedReturnCredits >= invoice.total && financials.acceptedReturnCredits > 0) {
+    status = 'credited';
+  } else if (financials.outstandingBalance === 0) {
+    status = 'paid';
+  } else if (financials.completedPayments > 0) {
+    status = 'partially_paid';
+  }
+  if (status !== invoice.status) {
+    db.prepare(`
+      UPDATE invoices SET status = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+      WHERE id = ?
+    `).run(status, invoiceId);
+  }
+  const paymentStatus = status === 'credited'
+    ? 'credited'
+    : financials.outstandingBalance === 0 ? 'paid'
+      : financials.completedPayments > 0 ? 'partial' : 'unpaid';
+  db.prepare('UPDATE orders SET payment_status = ? WHERE id = ?').run(paymentStatus, invoice.order_id);
+}
+
+function mapInvoice(db, invoice, items = []) {
+  const financials = getInvoiceFinancials(db, invoice);
+  return {
+    id: invoice.id,
+    invoiceNumber: invoice.invoice_number,
+    orderId: invoice.order_id,
+    orderNumber: invoice.order_number,
+    customerId: invoice.customer_id ?? null,
+    customerName: invoice.customer_name,
+    customerEmail: invoice.customer_email,
+    billingAddress: invoice.billing_address,
+    invoiceDate: invoice.invoice_date,
+    dueDate: invoice.due_date,
+    status: invoice.status,
+    subtotal: invoice.subtotal / 100,
+    discountTotal: invoice.discount_total / 100,
+    taxTotal: invoice.tax_total / 100,
+    total: invoice.total / 100,
+    completedPayments: financials.completedPayments / 100,
+    completedRefunds: financials.completedRefunds / 100,
+    acceptedReturnCredits: financials.acceptedReturnCredits / 100,
+    outstandingBalance: financials.outstandingBalance / 100,
+    unsettledReturnCredit: Math.max(0, financials.acceptedReturnCredits - financials.completedRefunds) / 100,
+    netCashRetained: financials.netCashRetained / 100,
+    paymentStatus: invoice.status === 'void'
+      ? 'void'
+      : invoice.status === 'draft'
+        ? 'unpaid'
+      : invoice.status === 'credited'
+        ? 'credited'
+        : financials.outstandingBalance === 0
+          ? 'paid'
+          : financials.completedPayments > 0 ? 'partial' : 'unpaid',
+    items: items.map(mapInvoiceItem),
+    createdAt: invoice.created_at,
+    updatedAt: invoice.updated_at,
+  };
+}
+
+function mapPayment(payment) {
+  return {
+    id: payment.id,
+    invoiceId: payment.invoice_id,
+    invoiceNumber: payment.invoice_number,
+    paymentReference: payment.payment_reference,
+    externalReference: payment.external_reference,
+    amount: payment.amount / 100,
+    currency: payment.currency,
+    method: payment.method,
+    status: payment.status,
+    paymentDate: payment.payment_date,
+    notes: payment.notes,
+    createdAt: payment.created_at,
+    updatedAt: payment.updated_at,
+  };
+}
+
+function mapRefund(refund) {
+  return {
+    id: refund.id,
+    refundReference: refund.refund_reference,
+    returnId: refund.return_id,
+    invoiceId: refund.invoice_id,
+    paymentId: refund.payment_id,
+    amount: refund.amount / 100,
+    currency: refund.currency,
+    method: refund.method,
+    externalReference: refund.external_reference,
+    status: refund.status,
+    notes: refund.notes,
+    createdAt: refund.created_at,
+    updatedAt: refund.updated_at,
+    completedAt: refund.completed_at,
+  };
+}
+
+function getSalesReturn(db, returnId) {
+  const salesReturn = db.prepare(`
+    SELECT sr.*, o.order_number, i.invoice_number
+    FROM sales_returns sr
+    JOIN orders o ON o.id = sr.order_id
+    LEFT JOIN invoices i ON i.id = sr.invoice_id
+    WHERE sr.id = ?
+  `).get(returnId);
+  if (!salesReturn) return null;
+  const items = db.prepare(`
+    SELECT * FROM sales_return_items WHERE return_id = ? ORDER BY id
+  `).all(returnId);
+  const refunds = db.prepare(`
+    SELECT * FROM refunds WHERE return_id = ? ORDER BY id
+  `).all(returnId);
+  const total = items.reduce((sum, item) => sum + item.refund_eligible_amount, 0);
+  const completedRefunds = refunds
+    .filter((refund) => refund.status === 'completed')
+    .reduce((sum, refund) => sum + refund.amount, 0);
+  return {
+    id: salesReturn.id,
+    returnNumber: salesReturn.return_number,
+    orderId: salesReturn.order_id,
+    orderNumber: salesReturn.order_number,
+    invoiceId: salesReturn.invoice_id,
+    invoiceNumber: salesReturn.invoice_number,
+    customerId: salesReturn.customer_id,
+    customerName: salesReturn.customer_name,
+    returnDate: salesReturn.return_date,
+    reason: salesReturn.reason,
+    status: salesReturn.status,
+    total: total / 100,
+    completedRefunds: completedRefunds / 100,
+    refundableBalance: Math.max(0, total - completedRefunds) / 100,
+    items: items.map((item) => ({
+      id: item.id,
+      orderItemId: item.order_item_id,
+      productId: item.product_id,
+      productName: item.product_name,
+      sku: item.sku,
+      quantity: item.quantity,
+      restockable: Boolean(item.restockable),
+      restockReason: item.restock_reason,
+      unitPrice: item.unit_price / 100,
+      refundEligibleAmount: item.refund_eligible_amount / 100,
+      createdAt: item.created_at,
+    })),
+    refunds: refunds.map((refund) => ({
+      id: refund.id,
+      refundReference: refund.refund_reference,
+      paymentId: refund.payment_id,
+      amount: refund.amount / 100,
+      method: refund.method,
+      externalReference: refund.external_reference,
+      status: refund.status,
+      notes: refund.notes,
+      createdAt: refund.created_at,
+      updatedAt: refund.updated_at,
+      completedAt: refund.completed_at,
+    })),
+    createdAt: salesReturn.created_at,
+    updatedAt: salesReturn.updated_at,
+    completedAt: salesReturn.completed_at,
   };
 }
 
@@ -1621,6 +1897,21 @@ export function createApp({
         error.status = 409;
         throw error;
       }
+      if (input.status === 'cancelled') {
+        const financialRecord = db.prepare(`
+          SELECT 1 FROM invoices
+          WHERE order_id = ? AND status != 'void'
+          UNION ALL
+          SELECT 1 FROM sales_returns
+          WHERE order_id = ? AND status != 'rejected'
+          LIMIT 1
+        `).get(orderId, orderId);
+        if (financialRecord) {
+          const error = new Error('An order with an active invoice or return cannot be cancelled.');
+          error.status = 409;
+          throw error;
+        }
+      }
       if (input.status === 'confirmed') {
         if (order.stock_deducted_at) {
           const error = new Error('Stock has already been deducted for this order.');
@@ -1680,6 +1971,732 @@ export function createApp({
   app.post('/api/orders', (req, res) => {
     const input = validate(orderSchema, req.body);
     res.status(201).json({ order: createSalesOrder(db, input, 'confirmed') });
+  });
+
+  app.post('/api/invoices', (req, res) => {
+    const input = validate(invoiceCreateSchema, req.body);
+    const create = db.transaction(() => {
+      const order = db.prepare('SELECT * FROM orders WHERE id = ?').get(input.orderId);
+      if (!order) throw notFound('Sales order not found.');
+      if (!['confirmed', 'processing', 'shipped', 'delivered'].includes(order.status) || !order.stock_deducted_at) {
+        const error = new Error('Only confirmed or fulfilled sales orders can be invoiced.');
+        error.status = 409;
+        throw error;
+      }
+      const items = db.prepare('SELECT * FROM order_items WHERE order_id = ? ORDER BY id').all(order.id);
+      const subtotal = items.reduce((sum, item) => sum + item.unit_price * item.quantity, 0);
+      if (!items.length || !Number.isSafeInteger(subtotal) || subtotal !== order.total) {
+        const error = new Error('Sales order lines do not reconcile with the stored order total.');
+        error.status = 409;
+        throw error;
+      }
+      const customer = order.customer_id
+        ? db.prepare('SELECT name, email, address FROM customers WHERE id = ?').get(order.customer_id)
+        : null;
+      const invoiceDate = input.invoiceDate ?? new Date().toISOString();
+      if (input.dueDate && Date.parse(input.dueDate) < Date.parse(invoiceDate)) {
+        const error = new Error('dueDate cannot be earlier than invoiceDate.');
+        error.status = 400;
+        throw error;
+      }
+      const inserted = db.prepare(`
+        INSERT INTO invoices (
+          invoice_number, order_id, customer_id, order_number, customer_name,
+          customer_email, billing_address, invoice_date, due_date, status,
+          subtotal, discount_total, tax_total, total
+        ) VALUES ('INVOICE-PENDING', ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, 0, 0, ?)
+      `).run(
+        order.id,
+        order.customer_id,
+        order.order_number,
+        customer?.name ?? order.customer_name,
+        customer?.email ?? null,
+        customer?.address ?? null,
+        invoiceDate,
+        input.dueDate ?? null,
+        subtotal,
+        subtotal,
+      );
+      const invoiceId = Number(inserted.lastInsertRowid);
+      const invoiceNumber = input.invoiceNumber ?? `INV-${String(invoiceId).padStart(5, '0')}`;
+      db.prepare('UPDATE invoices SET invoice_number = ? WHERE id = ?').run(invoiceNumber, invoiceId);
+      const insertItem = db.prepare(`
+        INSERT INTO invoice_items (
+          invoice_id, order_item_id, product_id, product_name, sku,
+          quantity, unit_price, subtotal, discount_amount, tax_amount, total
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?)
+      `);
+      for (const item of items) {
+        const lineTotal = item.unit_price * item.quantity;
+        if (!Number.isSafeInteger(lineTotal)) {
+          const error = new Error('Invoice line total exceeds the supported amount.');
+          error.status = 400;
+          throw error;
+        }
+        insertItem.run(
+          invoiceId,
+          item.id,
+          item.product_id,
+          item.product_name,
+          item.sku,
+          item.quantity,
+          item.unit_price,
+          lineTotal,
+          lineTotal,
+        );
+      }
+      return invoiceId;
+    });
+    const invoiceId = conflictOnUnique(() => create.immediate(), 'An active invoice already exists for this sales order or the invoice number is already in use.');
+    res.status(201).json({ invoice: mapInvoice(db, db.prepare('SELECT * FROM invoices WHERE id = ?').get(invoiceId),
+      db.prepare('SELECT * FROM invoice_items WHERE invoice_id = ? ORDER BY id').all(invoiceId)) });
+  });
+
+  app.get('/api/invoices', (req, res) => {
+    const page = req.query.page === undefined ? 1 : Number(req.query.page);
+    const pageSize = req.query.pageSize === undefined ? 50 : Number(req.query.pageSize);
+    const customerId = req.query.customerId === undefined ? undefined : Number(req.query.customerId);
+    const { status, from, to } = req.query;
+    if (!Number.isInteger(page) || page < 1 || !Number.isInteger(pageSize) || pageSize < 1 || pageSize > 100) {
+      return res.status(400).json({ error: 'page must be positive and pageSize must be between 1 and 100.' });
+    }
+    if (customerId !== undefined && (!Number.isSafeInteger(customerId) || customerId < 1)) {
+      return res.status(400).json({ error: 'customerId must be a positive integer.' });
+    }
+    if (status !== undefined && !['draft', 'issued', 'partially_paid', 'paid', 'credited', 'void'].includes(status)) {
+      return res.status(400).json({ error: 'Unsupported invoice status.' });
+    }
+    for (const date of [from, to]) {
+      if (date !== undefined && (typeof date !== 'string' || Number.isNaN(Date.parse(date)))) {
+        return res.status(400).json({ error: 'from and to must be valid dates.' });
+      }
+    }
+    const conditions = [];
+    const params = [];
+    if (status) conditions.push('status = ?'), params.push(status);
+    if (customerId !== undefined) conditions.push('customer_id = ?'), params.push(customerId);
+    if (from) conditions.push('invoice_date >= ?'), params.push(from);
+    if (to) conditions.push('invoice_date <= ?'), params.push(to);
+    const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+    const total = db.prepare(`SELECT COUNT(*) AS count FROM invoices ${where}`).get(...params).count;
+    const invoices = db.prepare(`
+      SELECT * FROM invoices ${where} ORDER BY id DESC LIMIT ? OFFSET ?
+    `).all(...params, pageSize, (page - 1) * pageSize);
+    res.json({
+      invoices: invoices.map((invoice) => mapInvoice(db, invoice)),
+      total,
+      page,
+      pageSize,
+      totalPages: Math.ceil(total / pageSize),
+    });
+  });
+
+  app.get('/api/invoices/:id', (req, res) => {
+    const invoiceId = parseId(req.params.id, 'Invoice');
+    const invoice = db.prepare('SELECT * FROM invoices WHERE id = ?').get(invoiceId);
+    if (!invoice) throw notFound('Invoice not found.');
+    const items = db.prepare('SELECT * FROM invoice_items WHERE invoice_id = ? ORDER BY id').all(invoiceId);
+    const payments = db.prepare(`
+      SELECT p.*, i.invoice_number FROM payments p JOIN invoices i ON i.id = p.invoice_id
+      WHERE p.invoice_id = ? ORDER BY p.id
+    `).all(invoiceId);
+    const returns = db.prepare('SELECT id FROM sales_returns WHERE invoice_id = ? ORDER BY id').all(invoiceId)
+      .map((row) => getSalesReturn(db, row.id));
+    res.json({
+      invoice: mapInvoice(db, invoice, items),
+      payments: payments.map(mapPayment),
+      returns,
+    });
+  });
+
+  app.post('/api/invoices/:id/issue', (req, res) => {
+    const invoiceId = parseId(req.params.id, 'Invoice');
+    const issue = db.transaction(() => {
+      const invoice = db.prepare('SELECT * FROM invoices WHERE id = ?').get(invoiceId);
+      if (!invoice) throw notFound('Invoice not found.');
+      if (invoice.status !== 'draft') {
+        const error = new Error(`Cannot issue an invoice in ${invoice.status} status.`);
+        error.status = 409;
+        throw error;
+      }
+      db.prepare(`
+        UPDATE invoices SET status = 'issued', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+        WHERE id = ? AND status = 'draft'
+      `).run(invoiceId);
+      if (invoice.total === 0) updateInvoiceFinancialStatus(db, invoiceId);
+      return db.prepare('SELECT * FROM invoices WHERE id = ?').get(invoiceId);
+    });
+    const invoice = issue.immediate();
+    res.json({ invoice: mapInvoice(db, invoice, db.prepare('SELECT * FROM invoice_items WHERE invoice_id = ? ORDER BY id').all(invoiceId)) });
+  });
+
+  app.post('/api/invoices/:id/void', (req, res) => {
+    const invoiceId = parseId(req.params.id, 'Invoice');
+    const voidInvoice = db.transaction(() => {
+      const invoice = db.prepare('SELECT * FROM invoices WHERE id = ?').get(invoiceId);
+      if (!invoice) throw notFound('Invoice not found.');
+      if (!['draft', 'issued'].includes(invoice.status)) {
+        const error = new Error('Only unpaid draft or issued invoices can be voided.');
+        error.status = 409;
+        throw error;
+      }
+      const hasFinancialActivity = db.prepare(`
+        SELECT 1 FROM payments WHERE invoice_id = ? AND status = 'completed'
+        UNION ALL SELECT 1 FROM sales_returns WHERE invoice_id = ? AND status != 'rejected'
+        UNION ALL SELECT 1 FROM refunds WHERE invoice_id = ? AND status IN ('requested', 'completed')
+        LIMIT 1
+      `).get(invoiceId, invoiceId, invoiceId);
+      if (hasFinancialActivity) {
+        const error = new Error('An invoice with completed payments or an active return/refund cannot be voided.');
+        error.status = 409;
+        throw error;
+      }
+      db.prepare(`
+        UPDATE invoices SET status = 'void', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+        WHERE id = ?
+      `).run(invoiceId);
+      db.prepare("UPDATE orders SET payment_status = 'unpaid' WHERE id = ?").run(invoice.order_id);
+      return db.prepare('SELECT * FROM invoices WHERE id = ?').get(invoiceId);
+    });
+    res.json({ invoice: mapInvoice(db, voidInvoice.immediate(), db.prepare('SELECT * FROM invoice_items WHERE invoice_id = ? ORDER BY id').all(invoiceId)) });
+  });
+
+  app.post('/api/invoices/:id/payments', (req, res) => {
+    const input = validate(paymentCreateSchema, req.body);
+    const invoiceId = parseId(req.params.id, 'Invoice');
+    const amount = moneyToMinorUnits(input.amount, 'Payment amount');
+    const record = db.transaction(() => {
+      const invoice = db.prepare('SELECT * FROM invoices WHERE id = ?').get(invoiceId);
+      if (!invoice) throw notFound('Invoice not found.');
+      if (!['issued', 'partially_paid'].includes(invoice.status)) {
+        const error = new Error('Payments can only be recorded against an issued, collectible invoice.');
+        error.status = 409;
+        throw error;
+      }
+      const financials = getInvoiceFinancials(db, invoice);
+      if (amount > financials.outstandingBalance) {
+        const error = new Error('Payment exceeds the invoice outstanding balance.');
+        error.status = 409;
+        throw error;
+      }
+      const inserted = db.prepare(`
+        INSERT INTO payments (
+          invoice_id, payment_reference, external_reference, amount, method,
+          status, payment_date, notes
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        invoiceId,
+        input.paymentReference ?? `PAY-${randomUUID()}`,
+        input.externalReference ?? null,
+        amount,
+        input.method,
+        input.status,
+        input.paymentDate ?? new Date().toISOString(),
+        input.notes ?? null,
+      );
+      const paymentId = Number(inserted.lastInsertRowid);
+      if (input.status === 'completed') updateInvoiceFinancialStatus(db, invoiceId);
+      return paymentId;
+    });
+    const paymentId = conflictOnUnique(() => record.immediate(), 'Payment reference or external transaction reference already exists.');
+    const payment = db.prepare(`
+      SELECT p.*, i.invoice_number FROM payments p JOIN invoices i ON i.id = p.invoice_id
+      WHERE p.id = ?
+    `).get(paymentId);
+    res.status(201).json({ payment: mapPayment(payment) });
+  });
+
+  app.get('/api/payments', (req, res) => {
+    const page = req.query.page === undefined ? 1 : Number(req.query.page);
+    const pageSize = req.query.pageSize === undefined ? 50 : Number(req.query.pageSize);
+    const invoiceId = req.query.invoiceId === undefined ? undefined : Number(req.query.invoiceId);
+    const { status, from, to } = req.query;
+    if (!Number.isInteger(page) || page < 1 || !Number.isInteger(pageSize) || pageSize < 1 || pageSize > 100) {
+      return res.status(400).json({ error: 'page must be positive and pageSize must be between 1 and 100.' });
+    }
+    if (invoiceId !== undefined && (!Number.isSafeInteger(invoiceId) || invoiceId < 1)) {
+      return res.status(400).json({ error: 'invoiceId must be a positive integer.' });
+    }
+    if (status !== undefined && !['completed', 'failed', 'reversed'].includes(status)) {
+      return res.status(400).json({ error: 'Unsupported payment status.' });
+    }
+    for (const date of [from, to]) {
+      if (date !== undefined && (typeof date !== 'string' || Number.isNaN(Date.parse(date)))) {
+        return res.status(400).json({ error: 'from and to must be valid dates.' });
+      }
+    }
+    const conditions = [];
+    const params = [];
+    if (invoiceId !== undefined) conditions.push('p.invoice_id = ?'), params.push(invoiceId);
+    if (status) conditions.push('p.status = ?'), params.push(status);
+    if (from) conditions.push('p.payment_date >= ?'), params.push(from);
+    if (to) conditions.push('p.payment_date <= ?'), params.push(to);
+    const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+    const total = db.prepare(`SELECT COUNT(*) AS count FROM payments p ${where}`).get(...params).count;
+    const rows = db.prepare(`
+      SELECT p.*, i.invoice_number FROM payments p JOIN invoices i ON i.id = p.invoice_id
+      ${where} ORDER BY p.id DESC LIMIT ? OFFSET ?
+    `).all(...params, pageSize, (page - 1) * pageSize);
+    res.json({ payments: rows.map(mapPayment), total, page, pageSize, totalPages: Math.ceil(total / pageSize) });
+  });
+
+  app.get('/api/payments/:id', (req, res) => {
+    const paymentId = parseId(req.params.id, 'Payment');
+    const payment = db.prepare(`
+      SELECT p.*, i.invoice_number FROM payments p JOIN invoices i ON i.id = p.invoice_id
+      WHERE p.id = ?
+    `).get(paymentId);
+    if (!payment) throw notFound('Payment not found.');
+    res.json({ payment: mapPayment(payment) });
+  });
+
+  app.post('/api/payments/:id/reverse', (req, res) => {
+    const paymentId = parseId(req.params.id, 'Payment');
+    const reverse = db.transaction(() => {
+      const payment = db.prepare('SELECT * FROM payments WHERE id = ?').get(paymentId);
+      if (!payment) throw notFound('Payment not found.');
+      if (payment.status !== 'completed') {
+        const error = new Error('Only completed payments can be reversed.');
+        error.status = 409;
+        throw error;
+      }
+      const hasRefund = db.prepare(`
+        SELECT 1 FROM refunds WHERE payment_id = ? AND status IN ('requested', 'completed') LIMIT 1
+      `).get(paymentId);
+      if (hasRefund) {
+        const error = new Error('A payment with a requested or completed refund cannot be reversed.');
+        error.status = 409;
+        throw error;
+      }
+      db.prepare(`
+        UPDATE payments SET status = 'reversed', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+        WHERE id = ? AND status = 'completed'
+      `).run(paymentId);
+      updateInvoiceFinancialStatus(db, payment.invoice_id);
+      return db.prepare(`
+        SELECT p.*, i.invoice_number FROM payments p JOIN invoices i ON i.id = p.invoice_id
+        WHERE p.id = ?
+      `).get(paymentId);
+    });
+    res.json({ payment: mapPayment(reverse.immediate()) });
+  });
+
+  app.post('/api/returns', (req, res) => {
+    const input = validate(returnCreateSchema, req.body);
+    const create = db.transaction(() => {
+      const order = db.prepare('SELECT * FROM orders WHERE id = ?').get(input.orderId);
+      if (!order) throw notFound('Sales order not found.');
+      if (!['confirmed', 'processing', 'shipped', 'delivered'].includes(order.status) || !order.stock_deducted_at) {
+        const error = new Error('Returns require a confirmed, non-cancelled sale with deducted stock.');
+        error.status = 409;
+        throw error;
+      }
+      const activeInvoice = db.prepare(`
+        SELECT * FROM invoices WHERE order_id = ? AND status != 'void' ORDER BY id DESC LIMIT 1
+      `).get(order.id);
+      const invoiceId = input.invoiceId ?? activeInvoice?.id ?? null;
+      let invoice = null;
+      if (invoiceId !== null) {
+        invoice = db.prepare('SELECT * FROM invoices WHERE id = ?').get(invoiceId);
+        if (!invoice || invoice.order_id !== order.id) {
+          const error = new Error('Invoice must belong to the referenced sales order.');
+          error.status = 400;
+          throw error;
+        }
+        if (!['issued', 'partially_paid', 'paid', 'credited'].includes(invoice.status)) {
+          const error = new Error('Returns require an issued, non-void invoice.');
+          error.status = 409;
+          throw error;
+        }
+      }
+      const orderItems = new Map(
+        db.prepare('SELECT * FROM order_items WHERE order_id = ?').all(order.id).map((item) => [item.id, item]),
+      );
+      const reservedLines = [];
+      let returnTotal = 0;
+      for (const line of input.items) {
+        const orderItem = orderItems.get(line.orderItemId);
+        if (!orderItem) {
+          const error = new Error(`Order item ${line.orderItemId} does not belong to this sales order.`);
+          error.status = 400;
+          throw error;
+        }
+        const reserved = db.prepare(`
+          SELECT COALESCE(SUM(sri.quantity), 0) AS quantity
+          FROM sales_return_items sri JOIN sales_returns sr ON sr.id = sri.return_id
+          WHERE sri.order_item_id = ? AND sr.status IN ('draft', 'accepted')
+        `).get(orderItem.id).quantity;
+        if (line.quantity + reserved > orderItem.quantity) {
+          const error = new Error('Returned quantity exceeds the sold quantity remaining for this order line.');
+          error.status = 409;
+          throw error;
+        }
+        const eligibleAmount = orderItem.unit_price * line.quantity;
+        if (!Number.isSafeInteger(eligibleAmount)) {
+          const error = new Error('Return amount exceeds the supported amount.');
+          error.status = 400;
+          throw error;
+        }
+        returnTotal += eligibleAmount;
+        reservedLines.push({ line, orderItem, eligibleAmount });
+      }
+      if (!Number.isSafeInteger(returnTotal)) {
+        const error = new Error('Return total exceeds the supported amount.');
+        error.status = 400;
+        throw error;
+      }
+      if (invoice) {
+        const reservedAmount = db.prepare(`
+          SELECT COALESCE(SUM(sri.refund_eligible_amount), 0) AS amount
+          FROM sales_return_items sri JOIN sales_returns sr ON sr.id = sri.return_id
+          WHERE sr.invoice_id = ? AND sr.status IN ('draft', 'accepted')
+        `).get(invoice.id).amount;
+        if (reservedAmount + returnTotal > invoice.total) {
+          const error = new Error('Return credit would exceed the invoice total.');
+          error.status = 409;
+          throw error;
+        }
+      }
+      const customer = order.customer_id
+        ? db.prepare('SELECT name FROM customers WHERE id = ?').get(order.customer_id)
+        : null;
+      const inserted = db.prepare(`
+        INSERT INTO sales_returns (
+          return_number, order_id, invoice_id, customer_id, customer_name,
+          return_date, reason, status
+        ) VALUES ('RETURN-PENDING', ?, ?, ?, ?, ?, ?, 'draft')
+      `).run(
+        order.id,
+        invoiceId,
+        order.customer_id,
+        customer?.name ?? order.customer_name,
+        input.returnDate ?? new Date().toISOString(),
+        input.reason,
+      );
+      const returnId = Number(inserted.lastInsertRowid);
+      const returnNumber = input.returnNumber ?? `RET-${String(returnId).padStart(5, '0')}`;
+      db.prepare('UPDATE sales_returns SET return_number = ? WHERE id = ?').run(returnNumber, returnId);
+      const insertItem = db.prepare(`
+        INSERT INTO sales_return_items (
+          return_id, order_item_id, product_id, product_name, sku,
+          quantity, restockable, restock_reason, unit_price, refund_eligible_amount
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      for (const { line, orderItem, eligibleAmount } of reservedLines) {
+        insertItem.run(
+          returnId,
+          orderItem.id,
+          orderItem.product_id,
+          orderItem.product_name,
+          orderItem.sku,
+          line.quantity,
+          Number(line.restockable),
+          line.restockReason,
+          orderItem.unit_price,
+          eligibleAmount,
+        );
+      }
+      return returnId;
+    });
+    const returnId = conflictOnUnique(() => create.immediate(), 'Return number already exists.');
+    res.status(201).json({ salesReturn: getSalesReturn(db, returnId) });
+  });
+
+  app.get('/api/returns', (req, res) => {
+    const page = req.query.page === undefined ? 1 : Number(req.query.page);
+    const pageSize = req.query.pageSize === undefined ? 50 : Number(req.query.pageSize);
+    const orderId = req.query.orderId === undefined ? undefined : Number(req.query.orderId);
+    const invoiceId = req.query.invoiceId === undefined ? undefined : Number(req.query.invoiceId);
+    const { status, from, to } = req.query;
+    if (!Number.isInteger(page) || page < 1 || !Number.isInteger(pageSize) || pageSize < 1 || pageSize > 100) {
+      return res.status(400).json({ error: 'page must be positive and pageSize must be between 1 and 100.' });
+    }
+    for (const [value, field] of [[orderId, 'orderId'], [invoiceId, 'invoiceId']]) {
+      if (value !== undefined && (!Number.isSafeInteger(value) || value < 1)) {
+        return res.status(400).json({ error: `${field} must be a positive integer.` });
+      }
+    }
+    if (status !== undefined && !['draft', 'accepted', 'rejected'].includes(status)) {
+      return res.status(400).json({ error: 'Unsupported return status.' });
+    }
+    for (const date of [from, to]) {
+      if (date !== undefined && (typeof date !== 'string' || Number.isNaN(Date.parse(date)))) {
+        return res.status(400).json({ error: 'from and to must be valid dates.' });
+      }
+    }
+    const conditions = [];
+    const params = [];
+    if (orderId !== undefined) conditions.push('order_id = ?'), params.push(orderId);
+    if (invoiceId !== undefined) conditions.push('invoice_id = ?'), params.push(invoiceId);
+    if (status) conditions.push('status = ?'), params.push(status);
+    if (from) conditions.push('return_date >= ?'), params.push(from);
+    if (to) conditions.push('return_date <= ?'), params.push(to);
+    const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+    const total = db.prepare(`SELECT COUNT(*) AS count FROM sales_returns ${where}`).get(...params).count;
+    const rows = db.prepare(`SELECT id FROM sales_returns ${where} ORDER BY id DESC LIMIT ? OFFSET ?`)
+      .all(...params, pageSize, (page - 1) * pageSize);
+    res.json({
+      returns: rows.map((row) => getSalesReturn(db, row.id)),
+      total,
+      page,
+      pageSize,
+      totalPages: Math.ceil(total / pageSize),
+    });
+  });
+
+  app.get('/api/returns/:id', (req, res) => {
+    const salesReturn = getSalesReturn(db, parseId(req.params.id, 'Return'));
+    if (!salesReturn) throw notFound('Return not found.');
+    res.json({ salesReturn });
+  });
+
+  app.post('/api/returns/:id/complete', (req, res) => {
+    const input = validate(returnCompleteSchema, req.body);
+    const returnId = parseId(req.params.id, 'Return');
+    const complete = db.transaction(() => {
+      const salesReturn = db.prepare('SELECT * FROM sales_returns WHERE id = ?').get(returnId);
+      if (!salesReturn) throw notFound('Return not found.');
+      if (salesReturn.status !== 'draft') {
+        const error = new Error(`Cannot complete a return in ${salesReturn.status} status.`);
+        error.status = 409;
+        throw error;
+      }
+      if (input.status === 'accepted') {
+        const order = db.prepare('SELECT * FROM orders WHERE id = ?').get(salesReturn.order_id);
+        if (!order || order.status === 'cancelled' || !order.stock_deducted_at) {
+          const error = new Error('A cancelled or unconfirmed sale cannot be accepted for return.');
+          error.status = 409;
+          throw error;
+        }
+        const items = db.prepare('SELECT * FROM sales_return_items WHERE return_id = ? ORDER BY id').all(returnId);
+        for (const item of items) {
+          const previouslyAccepted = db.prepare(`
+            SELECT COALESCE(SUM(sri.quantity), 0) AS quantity
+            FROM sales_return_items sri JOIN sales_returns sr ON sr.id = sri.return_id
+            WHERE sri.order_item_id = ? AND sr.status = 'accepted'
+          `).get(item.order_item_id).quantity;
+          const sold = db.prepare('SELECT quantity FROM order_items WHERE id = ?').get(item.order_item_id).quantity;
+          if (previouslyAccepted + item.quantity > sold) {
+            const error = new Error('Accepted return quantities exceed the sold quantity.');
+            error.status = 409;
+            throw error;
+          }
+        }
+        if (salesReturn.invoice_id) {
+          const invoice = db.prepare('SELECT * FROM invoices WHERE id = ?').get(salesReturn.invoice_id);
+          if (!invoice || invoice.status === 'void' || invoice.status === 'draft') {
+            const error = new Error('The associated invoice is no longer eligible for return credit.');
+            error.status = 409;
+            throw error;
+          }
+          const acceptedCredit = db.prepare(`
+            SELECT COALESCE(SUM(sri.refund_eligible_amount), 0) AS amount
+            FROM sales_return_items sri JOIN sales_returns sr ON sr.id = sri.return_id
+            WHERE sr.invoice_id = ? AND sr.status = 'accepted'
+          `).get(invoice.id).amount;
+          const currentCredit = items.reduce((sum, item) => sum + item.refund_eligible_amount, 0);
+          if (acceptedCredit + currentCredit > invoice.total) {
+            const error = new Error('Accepted return credit would exceed the invoice total.');
+            error.status = 409;
+            throw error;
+          }
+        }
+        for (const item of items) {
+          if (item.restockable) {
+            ledgerStockMovement(db, {
+              productId: item.product_id,
+              movementType: 'return_in',
+              quantityDelta: item.quantity,
+              referenceType: 'sales_return',
+              referenceId: returnId,
+              reason: item.restock_reason,
+            });
+          }
+        }
+      }
+      db.prepare(`
+        UPDATE sales_returns SET status = ?, completed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+          updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+        WHERE id = ? AND status = 'draft'
+      `).run(input.status, returnId);
+      if (input.status === 'accepted' && salesReturn.invoice_id) {
+        updateInvoiceFinancialStatus(db, salesReturn.invoice_id);
+      }
+      return getSalesReturn(db, returnId);
+    });
+    res.json({ salesReturn: complete.immediate() });
+  });
+
+  app.post('/api/returns/:id/refunds', (req, res) => {
+    const input = validate(refundCreateSchema, req.body);
+    const returnId = parseId(req.params.id, 'Return');
+    const amount = moneyToMinorUnits(input.amount, 'Refund amount');
+    const create = db.transaction(() => {
+      const salesReturn = db.prepare('SELECT * FROM sales_returns WHERE id = ?').get(returnId);
+      if (!salesReturn) throw notFound('Return not found.');
+      if (salesReturn.status !== 'accepted' || !salesReturn.invoice_id) {
+        const error = new Error('Refunds require an accepted return linked to an invoice.');
+        error.status = 409;
+        throw error;
+      }
+      const invoice = db.prepare('SELECT * FROM invoices WHERE id = ?').get(salesReturn.invoice_id);
+      const payment = db.prepare('SELECT * FROM payments WHERE id = ?').get(input.paymentId);
+      if (!invoice || !payment || payment.invoice_id !== invoice.id) {
+        const error = new Error('Payment must belong to the return invoice.');
+        error.status = 400;
+        throw error;
+      }
+      if (payment.status !== 'completed') {
+        const error = new Error('Refunds can only be paid from a completed payment.');
+        error.status = 409;
+        throw error;
+      }
+      const returnCredit = db.prepare(`
+        SELECT COALESCE(SUM(refund_eligible_amount), 0) AS amount
+        FROM sales_return_items WHERE return_id = ?
+      `).get(returnId).amount;
+      const reservedRefunds = db.prepare(`
+        SELECT COALESCE(SUM(amount), 0) AS amount FROM refunds
+        WHERE return_id = ? AND status IN ('requested', 'completed')
+      `).get(returnId).amount;
+      if (amount + reservedRefunds > returnCredit) {
+        const error = new Error('Refund exceeds the remaining eligible amount for this return.');
+        error.status = 409;
+        throw error;
+      }
+      const paymentRefunds = db.prepare(`
+        SELECT COALESCE(SUM(amount), 0) AS amount FROM refunds
+        WHERE payment_id = ? AND status IN ('requested', 'completed')
+      `).get(payment.id).amount;
+      if (amount + paymentRefunds > payment.amount) {
+        const error = new Error('Refund exceeds the unrefunded amount of the selected payment.');
+        error.status = 409;
+        throw error;
+      }
+      const inserted = db.prepare(`
+        INSERT INTO refunds (
+          refund_reference, return_id, invoice_id, payment_id,
+          amount, method, external_reference, status, notes
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'requested', ?)
+      `).run(
+        input.refundReference ?? `REF-${randomUUID()}`,
+        returnId,
+        invoice.id,
+        payment.id,
+        amount,
+        input.method,
+        input.externalReference ?? null,
+        input.notes ?? null,
+      );
+      const refundId = Number(inserted.lastInsertRowid);
+      return refundId;
+    });
+    const refundId = conflictOnUnique(() => create.immediate(), 'Refund reference or external transaction reference already exists.');
+    res.status(201).json({ refund: mapRefund(db.prepare('SELECT * FROM refunds WHERE id = ?').get(refundId)) });
+  });
+
+  app.post('/api/refunds/:id/complete', (req, res) => {
+    const refundId = parseId(req.params.id, 'Refund');
+    const complete = db.transaction(() => {
+      const refund = db.prepare('SELECT * FROM refunds WHERE id = ?').get(refundId);
+      if (!refund) throw notFound('Refund not found.');
+      if (refund.status !== 'requested') {
+        const error = new Error(`Cannot complete a refund in ${refund.status} status.`);
+        error.status = 409;
+        throw error;
+      }
+      const salesReturn = db.prepare('SELECT status FROM sales_returns WHERE id = ?').get(refund.return_id);
+      const payment = db.prepare('SELECT status, amount FROM payments WHERE id = ?').get(refund.payment_id);
+      if (salesReturn?.status !== 'accepted' || payment?.status !== 'completed') {
+        const error = new Error('Refund eligibility changed before completion.');
+        error.status = 409;
+        throw error;
+      }
+      const reservedForReturn = db.prepare(`
+        SELECT COALESCE(SUM(amount), 0) AS amount FROM refunds
+        WHERE return_id = ? AND status IN ('requested', 'completed')
+      `).get(refund.return_id).amount;
+      const eligible = db.prepare(`
+        SELECT COALESCE(SUM(refund_eligible_amount), 0) AS amount
+        FROM sales_return_items WHERE return_id = ?
+      `).get(refund.return_id).amount;
+      if (reservedForReturn > eligible) {
+        const error = new Error('Refund reservations exceed the eligible return credit.');
+        error.status = 409;
+        throw error;
+      }
+      const reservedForPayment = db.prepare(`
+        SELECT COALESCE(SUM(amount), 0) AS amount FROM refunds
+        WHERE payment_id = ? AND status IN ('requested', 'completed')
+      `).get(refund.payment_id).amount;
+      if (reservedForPayment > payment.amount) {
+        const error = new Error('Refund reservations exceed the completed payment.');
+        error.status = 409;
+        throw error;
+      }
+      db.prepare(`
+        UPDATE refunds SET status = 'completed', completed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+          updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+        WHERE id = ? AND status = 'requested'
+      `).run(refundId);
+      updateInvoiceFinancialStatus(db, refund.invoice_id);
+      return db.prepare('SELECT * FROM refunds WHERE id = ?').get(refundId);
+    });
+    res.json({ refund: mapRefund(complete.immediate()) });
+  });
+
+  app.post('/api/refunds/:id/fail', (req, res) => {
+    const refundId = parseId(req.params.id, 'Refund');
+    const fail = db.transaction(() => {
+      const refund = db.prepare('SELECT * FROM refunds WHERE id = ?').get(refundId);
+      if (!refund) throw notFound('Refund not found.');
+      if (refund.status !== 'requested') {
+        const error = new Error(`Cannot fail a refund in ${refund.status} status.`);
+        error.status = 409;
+        throw error;
+      }
+      db.prepare(`
+        UPDATE refunds SET status = 'failed', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+        WHERE id = ? AND status = 'requested'
+      `).run(refundId);
+      return db.prepare('SELECT * FROM refunds WHERE id = ?').get(refundId);
+    });
+    res.json({ refund: mapRefund(fail.immediate()) });
+  });
+
+  app.get('/api/refunds', (req, res) => {
+    const page = req.query.page === undefined ? 1 : Number(req.query.page);
+    const pageSize = req.query.pageSize === undefined ? 50 : Number(req.query.pageSize);
+    const invoiceId = req.query.invoiceId === undefined ? undefined : Number(req.query.invoiceId);
+    const returnId = req.query.returnId === undefined ? undefined : Number(req.query.returnId);
+    const { status } = req.query;
+    if (!Number.isInteger(page) || page < 1 || !Number.isInteger(pageSize) || pageSize < 1 || pageSize > 100) {
+      return res.status(400).json({ error: 'page must be positive and pageSize must be between 1 and 100.' });
+    }
+    for (const [value, field] of [[invoiceId, 'invoiceId'], [returnId, 'returnId']]) {
+      if (value !== undefined && (!Number.isSafeInteger(value) || value < 1)) {
+        return res.status(400).json({ error: `${field} must be a positive integer.` });
+      }
+    }
+    if (status !== undefined && !['requested', 'completed', 'failed'].includes(status)) {
+      return res.status(400).json({ error: 'Unsupported refund status.' });
+    }
+    const conditions = [];
+    const params = [];
+    if (invoiceId !== undefined) conditions.push('invoice_id = ?'), params.push(invoiceId);
+    if (returnId !== undefined) conditions.push('return_id = ?'), params.push(returnId);
+    if (status) conditions.push('status = ?'), params.push(status);
+    const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+    const total = db.prepare(`SELECT COUNT(*) AS count FROM refunds ${where}`).get(...params).count;
+    const refunds = db.prepare(`SELECT * FROM refunds ${where} ORDER BY id DESC LIMIT ? OFFSET ?`)
+      .all(...params, pageSize, (page - 1) * pageSize);
+    res.json({ refunds: refunds.map(mapRefund), total, page, pageSize, totalPages: Math.ceil(total / pageSize) });
+  });
+
+  app.get('/api/refunds/:id', (req, res) => {
+    const refund = db.prepare('SELECT * FROM refunds WHERE id = ?').get(parseId(req.params.id, 'Refund'));
+    if (!refund) throw notFound('Refund not found.');
+    res.json({ refund: mapRefund(refund) });
   });
 
   app.use((error, _req, res, _next) => {

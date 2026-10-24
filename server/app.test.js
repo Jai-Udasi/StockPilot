@@ -700,6 +700,432 @@ describe('Core business data APIs', () => {
   });
 });
 
+describe('Invoices, payments, returns, and refunds', () => {
+  let db;
+  let client;
+
+  beforeEach(() => {
+    db = createDatabase(':memory:');
+    client = request(createApp({ db }));
+  });
+
+  afterEach(() => db.close());
+
+  async function createProduct(overrides = {}) {
+    const response = await client.post('/api/products').send({
+      sku: 'FINANCIAL-01',
+      name: 'Financial Test Item',
+      category: 'Testing',
+      price: 10,
+      quantity: 20,
+      ...overrides,
+    });
+    assert.equal(response.status, 201, JSON.stringify(response.body));
+    return response.body.product;
+  }
+
+  async function createCustomer(overrides = {}) {
+    const response = await client.post('/api/customers').send({
+      customerCode: 'FIN-CUSTOMER',
+      name: 'Financial Customer',
+      email: 'financial@example.test',
+      address: '10 Ledger Lane',
+      ...overrides,
+    });
+    assert.equal(response.status, 201, JSON.stringify(response.body));
+    return response.body.customer;
+  }
+
+  async function createSale(product, quantity, customerId) {
+    const response = await client.post('/api/orders').send({
+      ...(customerId ? { customerId } : {}),
+      items: [{ productId: product.id, quantity }],
+    });
+    assert.equal(response.status, 201, JSON.stringify(response.body));
+    return response.body.order;
+  }
+
+  async function issueInvoice(order, invoiceOverrides = {}) {
+    const created = await client.post('/api/invoices').send({ orderId: order.id, ...invoiceOverrides });
+    assert.equal(created.status, 201, JSON.stringify(created.body));
+    const issued = await client.post(`/api/invoices/${created.body.invoice.id}/issue`);
+    assert.equal(issued.status, 200, JSON.stringify(issued.body));
+    return issued.body.invoice;
+  }
+
+  function returnPayload(order, orderItemId, overrides = {}) {
+    return {
+      orderId: order.id,
+      reason: 'Customer returned the item',
+      items: [{
+        orderItemId,
+        quantity: 1,
+        restockable: true,
+        restockReason: 'Inspected and suitable for resale',
+      }],
+      ...overrides,
+    };
+  }
+
+  it('creates and issues immutable invoice snapshots and enforces invoice eligibility/idempotency', async () => {
+    const product = await createProduct({ price: 12.34 });
+    const customer = await createCustomer();
+    const order = await createSale(product, 2, customer.id);
+    const created = await client.post('/api/invoices').send({
+      orderId: order.id,
+      dueDate: '2026-11-01T00:00:00.000Z',
+    });
+    assert.equal(created.status, 201, JSON.stringify(created.body));
+    const invoiceId = created.body.invoice.id;
+    assert.equal(created.body.invoice.status, 'draft');
+    assert.equal(created.body.invoice.invoiceNumber, 'INV-00001');
+    assert.equal(created.body.invoice.subtotal, 24.68);
+    assert.equal(created.body.invoice.discountTotal, 0);
+    assert.equal(created.body.invoice.taxTotal, 0);
+    assert.equal(created.body.invoice.total, 24.68);
+    assert.equal(created.body.invoice.items[0].quantity, 2);
+    assert.equal(created.body.invoice.customerName, customer.name);
+    assert.equal(created.body.invoice.billingAddress, customer.address);
+
+    assert.equal((await client.post('/api/invoices').send({ orderId: order.id })).status, 409);
+    assert.equal((await client.post(`/api/invoices/${invoiceId}/issue`)).status, 200);
+    assert.equal((await client.post(`/api/invoices/${invoiceId}/issue`)).status, 409);
+    await client.put(`/api/products/${product.id}`).send({ name: 'Renamed Item', price: 99 });
+    await client.put(`/api/customers/${customer.id}`).send({
+      name: 'Updated Customer',
+      email: 'updated@example.test',
+      address: 'Updated address',
+    });
+    assert.throws(() => db.prepare('UPDATE invoices SET total = 1 WHERE id = ?').run(invoiceId), /immutable/i);
+    assert.throws(() => db.prepare('UPDATE invoice_items SET unit_price = 1 WHERE invoice_id = ?').run(invoiceId), /immutable/i);
+    const detail = await client.get(`/api/invoices/${invoiceId}`);
+    assert.equal(detail.status, 200);
+    assert.equal(detail.body.invoice.customerName, 'Financial Customer');
+    assert.equal(detail.body.invoice.customerEmail, 'financial@example.test');
+    assert.equal(detail.body.invoice.billingAddress, '10 Ledger Lane');
+    assert.equal(detail.body.invoice.items[0].productName, 'Financial Test Item');
+    assert.equal(detail.body.invoice.items[0].unitPrice, 12.34);
+    const filtered = await client.get('/api/invoices').query({ status: 'issued', customerId: customer.id, page: 1, pageSize: 1 });
+    assert.equal(filtered.body.total, 1);
+    assert.equal(filtered.body.invoices[0].invoiceNumber, 'INV-00001');
+    assert.equal((await client.post(`/api/invoices/${invoiceId}/void`)).body.invoice.status, 'void');
+    const replacement = await client.post('/api/invoices').send({ orderId: order.id, invoiceNumber: 'INV-REISSUED' });
+    assert.equal(replacement.status, 201);
+
+    const draft = await client.post('/api/orders/drafts').send({ items: [{ productId: product.id, quantity: 1 }] });
+    assert.equal(draft.status, 201);
+    assert.equal((await client.post('/api/invoices').send({ orderId: draft.body.order.id })).status, 409);
+    await client.patch(`/api/orders/${draft.body.order.id}/status`).send({ status: 'cancelled' });
+    assert.equal((await client.post('/api/invoices').send({ orderId: draft.body.order.id })).status, 409);
+    assert.equal(db.pragma('foreign_key_check').length, 0);
+  });
+
+  it('records partial/full/failed payments, prevents overpayment and duplicate references, and reverses safely', async () => {
+    const product = await createProduct();
+    const order = await createSale(product, 4);
+    const invoice = await issueInvoice(order);
+    assert.equal(invoice.total, 40);
+    const orderDetail = await client.get(`/api/orders/${order.id}`);
+    assert.equal(orderDetail.body.order.items[0].orderItemId, db.prepare('SELECT id FROM order_items WHERE order_id = ?').get(order.id).id);
+
+    assert.equal((await client.post(`/api/invoices/${invoice.id}/payments`).send({
+      amount: 0,
+      method: 'cash',
+    })).status, 400);
+    assert.equal((await client.post(`/api/invoices/${invoice.id}/payments`).send({
+      amount: -1,
+      method: 'cash',
+    })).status, 400);
+    const failed = await client.post(`/api/invoices/${invoice.id}/payments`).send({
+      amount: 5,
+      method: 'card',
+      status: 'failed',
+      externalReference: 'PAY-FAILED-01',
+    });
+    assert.equal(failed.status, 201);
+    assert.equal((await client.get(`/api/invoices/${invoice.id}`)).body.invoice.completedPayments, 0);
+    assert.equal((await client.get(`/api/invoices/${invoice.id}`)).body.invoice.outstandingBalance, 40);
+
+    const first = await client.post(`/api/invoices/${invoice.id}/payments`).send({
+      amount: 15,
+      method: 'card',
+      externalReference: 'PAY-EXT-01',
+    });
+    assert.equal(first.status, 201, JSON.stringify(first.body));
+    let details = (await client.get(`/api/invoices/${invoice.id}`)).body;
+    assert.equal(details.invoice.status, 'partially_paid');
+    assert.equal(details.invoice.completedPayments, 15);
+    assert.equal(details.invoice.outstandingBalance, 25);
+    assert.equal((await client.post(`/api/invoices/${invoice.id}/payments`).send({
+      amount: 1,
+      method: 'card',
+      externalReference: 'PAY-EXT-01',
+    })).status, 409);
+    assert.equal((await client.post(`/api/invoices/${invoice.id}/payments`).send({
+      amount: 26,
+      method: 'cash',
+    })).status, 409);
+
+    const second = await client.post(`/api/invoices/${invoice.id}/payments`).send({
+      amount: 25,
+      method: 'cash',
+      paymentReference: 'PAY-FINAL-01',
+    });
+    assert.equal(second.status, 201);
+    details = (await client.get(`/api/invoices/${invoice.id}`)).body;
+    assert.equal(details.invoice.status, 'paid');
+    assert.equal(details.invoice.outstandingBalance, 0);
+    assert.equal(details.payments.length, 3);
+    assert.equal((await client.get('/api/payments').query({ invoiceId: invoice.id, status: 'failed' })).body.total, 1);
+
+    const reversed = await client.post(`/api/payments/${first.body.payment.id}/reverse`);
+    assert.equal(reversed.status, 200);
+    assert.equal(reversed.body.payment.status, 'reversed');
+    details = (await client.get(`/api/invoices/${invoice.id}`)).body;
+    assert.equal(details.invoice.status, 'partially_paid');
+    assert.equal(details.invoice.completedPayments, 25);
+    assert.equal(details.invoice.outstandingBalance, 15);
+    assert.equal((await client.post(`/api/payments/${first.body.payment.id}/reverse`)).status, 409);
+
+    const concurrentInvoice = await issueInvoice(await createSale(product, 2));
+    const attempts = await Promise.all([1, 2].map(() => client.post(`/api/invoices/${concurrentInvoice.id}/payments`).send({
+      amount: 15,
+      method: 'cash',
+    })));
+    assert.deepEqual(attempts.map((response) => response.status).sort(), [201, 409]);
+    assert.equal((await client.get(`/api/invoices/${concurrentInvoice.id}`)).body.invoice.completedPayments, 15);
+  });
+
+  it('accepts bounded returns, restocks only eligible lines once, and records partial/full refunds', async () => {
+    const product = await createProduct({ quantity: 10 });
+    const order = await createSale(product, 4);
+    const orderItemId = db.prepare('SELECT id FROM order_items WHERE order_id = ?').get(order.id).id;
+    const invoice = await issueInvoice(order);
+    const payment = await client.post(`/api/invoices/${invoice.id}/payments`).send({
+      amount: 40,
+      method: 'card',
+    });
+    assert.equal(payment.status, 201);
+    const stockAfterSale = (await client.get(`/api/products/${product.id}`)).body.product.quantity;
+
+    const first = await client.post('/api/returns').send(returnPayload(order, orderItemId, { invoiceId: invoice.id }));
+    assert.equal(first.status, 201, JSON.stringify(first.body));
+    assert.equal(first.body.salesReturn.status, 'draft');
+    const firstId = first.body.salesReturn.id;
+    const accepted = await client.post(`/api/returns/${firstId}/complete`).send({ status: 'accepted' });
+    assert.equal(accepted.status, 200);
+    assert.equal((await client.get(`/api/products/${product.id}`)).body.product.quantity, stockAfterSale + 1);
+    const movementCount = db.prepare(`
+      SELECT COUNT(*) AS count FROM stock_movements
+      WHERE reference_type = 'sales_return' AND reference_id = ?
+    `).get(firstId).count;
+    assert.equal(movementCount, 1);
+    assert.equal((await client.post(`/api/returns/${firstId}/complete`).send({ status: 'accepted' })).status, 409);
+    assert.equal(db.prepare(`
+      SELECT COUNT(*) AS count FROM stock_movements
+      WHERE reference_type = 'sales_return' AND reference_id = ?
+    `).get(firstId).count, 1);
+    assert.ok(getStockReconciliationReport(db).every((row) => row.reconciled === 1));
+
+    const second = await client.post('/api/returns').send(returnPayload(order, orderItemId, {
+      invoiceId: invoice.id,
+      items: [{
+        orderItemId,
+        quantity: 2,
+        restockable: false,
+        restockReason: 'Packaging was opened',
+      }],
+    }));
+    assert.equal(second.status, 201);
+    assert.equal((await client.post(`/api/returns/${second.body.salesReturn.id}/complete`).send({ status: 'accepted' })).status, 200);
+    assert.equal((await client.get(`/api/products/${product.id}`)).body.product.quantity, stockAfterSale + 1);
+
+    const overReturn = await client.post('/api/returns').send(returnPayload(order, orderItemId, {
+      invoiceId: invoice.id,
+      items: [{
+        orderItemId,
+        quantity: 2,
+        restockable: false,
+        restockReason: 'Excess quantity attempt',
+      }],
+    }));
+    assert.equal(overReturn.status, 409);
+
+    const failedRefund = await client.post(`/api/returns/${firstId}/refunds`).send({
+      paymentId: payment.body.payment.id,
+      amount: 3,
+      method: 'card',
+    });
+    assert.equal(failedRefund.status, 201);
+    assert.equal((await client.post(`/api/refunds/${failedRefund.body.refund.id}/fail`)).status, 200);
+    let invoiceDetails = (await client.get(`/api/invoices/${invoice.id}`)).body.invoice;
+    assert.equal(invoiceDetails.completedRefunds, 0);
+
+    const partialRefund = await client.post(`/api/returns/${firstId}/refunds`).send({
+      paymentId: payment.body.payment.id,
+      amount: 6,
+      method: 'card',
+      externalReference: 'REFUND-EXT-01',
+    });
+    assert.equal(partialRefund.status, 201);
+    assert.equal((await client.post(`/api/refunds/${partialRefund.body.refund.id}/complete`)).status, 200);
+    assert.equal((await client.post(`/api/refunds/${partialRefund.body.refund.id}/complete`)).status, 409);
+    assert.equal((await client.post(`/api/returns/${firstId}/refunds`).send({
+      paymentId: payment.body.payment.id,
+      amount: 5,
+      method: 'card',
+    })).status, 409);
+    const finalRefund = await client.post(`/api/returns/${firstId}/refunds`).send({
+      paymentId: payment.body.payment.id,
+      amount: 4,
+      method: 'card',
+    });
+    assert.equal(finalRefund.status, 201);
+    assert.equal((await client.post(`/api/refunds/${finalRefund.body.refund.id}/complete`)).status, 200);
+    const secondReturnRefund = await client.post(`/api/returns/${second.body.salesReturn.id}/refunds`).send({
+      paymentId: payment.body.payment.id,
+      amount: 20,
+      method: 'card',
+    });
+    assert.equal(secondReturnRefund.status, 201);
+    assert.equal((await client.post(`/api/refunds/${secondReturnRefund.body.refund.id}/complete`)).status, 200);
+
+    invoiceDetails = (await client.get(`/api/invoices/${invoice.id}`)).body.invoice;
+    assert.equal(invoiceDetails.acceptedReturnCredits, 30);
+    assert.equal(invoiceDetails.completedPayments, 40);
+    assert.equal(invoiceDetails.completedRefunds, 30);
+    assert.equal(invoiceDetails.outstandingBalance, 0);
+    assert.equal(invoiceDetails.netCashRetained, 10);
+    assert.equal((await client.get('/api/returns').query({ invoiceId: invoice.id, status: 'accepted' })).body.total, 2);
+    assert.equal((await client.get('/api/refunds').query({ invoiceId: invoice.id, status: 'completed' })).body.total, 3);
+    assert.equal((await client.get(`/api/returns/${firstId}`)).body.salesReturn.refundableBalance, 0);
+  });
+
+  it('caps refunds at both the accepted credit and money collected from the selected payment', async () => {
+    const product = await createProduct();
+    const order = await createSale(product, 2);
+    const orderItemId = db.prepare('SELECT id FROM order_items WHERE order_id = ?').get(order.id).id;
+    const invoice = await issueInvoice(order);
+    const payment = await client.post(`/api/invoices/${invoice.id}/payments`).send({
+      amount: 5,
+      method: 'cash',
+    });
+    assert.equal(payment.status, 201);
+    const salesReturn = await client.post('/api/returns').send(returnPayload(order, orderItemId, {
+      invoiceId: invoice.id,
+      items: [{
+        orderItemId,
+        quantity: 1,
+        restockable: false,
+        restockReason: 'Customer retained damaged packaging',
+      }],
+    }));
+    assert.equal(salesReturn.status, 201);
+    assert.equal((await client.post(`/api/returns/${salesReturn.body.salesReturn.id}/complete`).send({ status: 'accepted' })).status, 200);
+    assert.equal((await client.post(`/api/returns/${salesReturn.body.salesReturn.id}/refunds`).send({
+      paymentId: payment.body.payment.id,
+      amount: 6,
+      method: 'cash',
+    })).status, 409);
+    const refund = await client.post(`/api/returns/${salesReturn.body.salesReturn.id}/refunds`).send({
+      paymentId: payment.body.payment.id,
+      amount: 5,
+      method: 'cash',
+      externalReference: 'REFUND-ONCE',
+    });
+    assert.equal(refund.status, 201);
+    assert.equal((await client.post(`/api/returns/${salesReturn.body.salesReturn.id}/refunds`).send({
+      paymentId: payment.body.payment.id,
+      amount: 1,
+      method: 'cash',
+      externalReference: 'REFUND-ONCE',
+    })).status, 409);
+    assert.equal((await client.post(`/api/refunds/${refund.body.refund.id}/complete`)).status, 200);
+    const invoiceDetails = (await client.get(`/api/invoices/${invoice.id}`)).body.invoice;
+    assert.equal(invoiceDetails.completedRefunds, 5);
+    assert.equal(invoiceDetails.unsettledReturnCredit, 5);
+    assert.equal(invoiceDetails.outstandingBalance, 5);
+    assert.equal(invoiceDetails.paymentStatus, 'partial');
+  });
+
+  it('prevents cancellation/returns from restoring the same units and rolls back return acceptance on ledger failure', async () => {
+    const product = await createProduct({ quantity: 10 });
+    const order = await createSale(product, 2);
+    const orderItemId = db.prepare('SELECT id FROM order_items WHERE order_id = ?').get(order.id).id;
+    const invoice = await issueInvoice(order);
+    assert.equal((await client.patch(`/api/orders/${order.id}/status`).send({ status: 'cancelled' })).status, 409);
+    const salesReturn = await client.post('/api/returns').send(returnPayload(order, orderItemId, { invoiceId: invoice.id }));
+    assert.equal(salesReturn.status, 201);
+    const returnId = salesReturn.body.salesReturn.id;
+    const stockBefore = (await client.get(`/api/products/${product.id}`)).body.product.quantity;
+    db.exec(`
+      CREATE TRIGGER test_return_ledger_failure
+      BEFORE INSERT ON stock_movements
+      WHEN NEW.reference_type = 'sales_return'
+      BEGIN SELECT RAISE(ABORT, 'return ledger failure'); END;
+    `);
+    const failedCompletion = await client.post(`/api/returns/${returnId}/complete`).send({ status: 'accepted' });
+    assert.equal(failedCompletion.status, 500);
+    assert.equal((await client.get(`/api/products/${product.id}`)).body.product.quantity, stockBefore);
+    assert.equal((await client.get(`/api/returns/${returnId}`)).body.salesReturn.status, 'draft');
+    assert.equal(db.prepare(`
+      SELECT COUNT(*) AS count FROM stock_movements
+      WHERE reference_type = 'sales_return' AND reference_id = ?
+    `).get(returnId).count, 0);
+    db.exec('DROP TRIGGER test_return_ledger_failure');
+    assert.equal((await client.post(`/api/returns/${returnId}/complete`).send({ status: 'accepted' })).status, 200);
+    assert.equal((await client.patch(`/api/orders/${order.id}/status`).send({ status: 'cancelled' })).status, 409);
+    assert.equal(db.pragma('foreign_key_check').length, 0);
+
+    const uncapturedOrder = await createSale(product, 1);
+    assert.equal((await client.patch(`/api/orders/${uncapturedOrder.id}/status`).send({ status: 'cancelled' })).status, 200);
+    const canceledItemId = db.prepare('SELECT id FROM order_items WHERE order_id = ?').get(uncapturedOrder.id).id;
+    assert.equal((await client.post('/api/returns').send(returnPayload(uncapturedOrder, canceledItemId))).status, 409);
+  });
+
+  it('rejects invalid financial foreign keys and returns consistent filtered histories', async () => {
+    const product = await createProduct();
+    const order = await createSale(product, 1);
+    const invoice = await issueInvoice(order);
+    const payment = await client.post(`/api/invoices/${invoice.id}/payments`).send({
+      amount: 10,
+      method: 'cash',
+    });
+    assert.equal(payment.status, 201);
+    const orderItemId = db.prepare('SELECT id FROM order_items WHERE order_id = ?').get(order.id).id;
+    const salesReturn = await client.post('/api/returns').send(returnPayload(order, orderItemId, { invoiceId: invoice.id }));
+    assert.equal(salesReturn.status, 201);
+    assert.equal((await client.post(`/api/returns/${salesReturn.body.salesReturn.id}/complete`).send({ status: 'accepted' })).status, 200);
+
+    assert.throws(() => db.prepare(`
+      INSERT INTO invoice_items (
+        invoice_id, order_item_id, product_id, product_name, sku, quantity,
+        unit_price, subtotal, discount_amount, tax_amount, total
+      ) VALUES (999, 999, 999, 'invalid', 'invalid', 1, 1, 1, 0, 0, 1)
+    `).run(), /FOREIGN KEY|SQLITE_CONSTRAINT_FOREIGNKEY/);
+    assert.throws(() => db.prepare(`
+      INSERT INTO payments (invoice_id, payment_reference, amount, method, status, payment_date)
+      VALUES (999, 'BAD-PAYMENT', 1, 'cash', 'completed', '2026-10-24T00:00:00.000Z')
+    `).run(), /FOREIGN KEY|SQLITE_CONSTRAINT_FOREIGNKEY/);
+    assert.throws(() => db.prepare(`
+      INSERT INTO sales_returns (return_number, order_id, customer_name, return_date, reason, status)
+      VALUES ('BAD-RETURN', 999, 'Invalid', '2026-10-24T00:00:00.000Z', 'Foreign key check', 'draft')
+    `).run(), /FOREIGN KEY|SQLITE_CONSTRAINT_FOREIGNKEY/);
+    assert.throws(() => db.prepare(`
+      INSERT INTO refunds (
+        refund_reference, return_id, invoice_id, payment_id, amount, method, status
+      ) VALUES ('BAD-REFUND', 999, ?, ?, 1, 'cash', 'requested')
+    `).run(invoice.id, payment.body.payment.id), /FOREIGN KEY|SQLITE_CONSTRAINT_FOREIGNKEY/);
+    assert.equal((await client.post('/api/invoices/999/payments').send({ amount: 1, method: 'cash' })).status, 404);
+    assert.equal((await client.get('/api/refunds/999')).status, 404);
+    assert.equal((await client.get('/api/invoices').query({ page: 1, pageSize: 1 })).body.total, 1);
+    assert.equal((await client.get('/api/payments').query({ invoiceId: invoice.id, status: 'completed' })).body.total, 1);
+    assert.equal((await client.get('/api/returns').query({ orderId: order.id, status: 'accepted' })).body.total, 1);
+    assert.equal((await client.get(`/api/invoices/${invoice.id}`)).body.returns[0].returnNumber, salesReturn.body.salesReturn.returnNumber);
+    assert.equal(db.pragma('foreign_key_check').length, 0);
+  });
+});
+
 describe('Database foundation', () => {
   it('initializes the schema, migration metadata, and deterministic seed data', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'stockpilot-seed-'));
@@ -710,7 +1136,10 @@ describe('Database foundation', () => {
     assert.ok(db.prepare('SELECT 1 FROM schema_migrations LIMIT 1').get());
 
     const migrationCount = db.prepare('SELECT COUNT(*) AS count FROM schema_migrations').get().count;
-    assert.equal(migrationCount, 5);
+    assert.equal(migrationCount, 6);
+    for (const table of ['invoices', 'invoice_items', 'payments', 'sales_returns', 'sales_return_items', 'refunds']) {
+      assert.ok(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(table));
+    }
 
     const productCount = db.prepare('SELECT COUNT(*) AS count FROM products').get().count;
     const categoryCount = db.prepare('SELECT COUNT(*) AS count FROM categories').get().count;
@@ -809,7 +1238,8 @@ describe('Database foundation', () => {
     assert.ok(files.some((name) => name.startsWith('stockpilot.db.bak-')));
 
     const migrationVersion = migratedDb.prepare('SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1').get().version;
-    assert.equal(migrationVersion, 5);
+    assert.equal(migrationVersion, 6);
+    assert.equal(migratedDb.pragma('foreign_key_check').length, 0);
     migratedDb.close();
   });
 

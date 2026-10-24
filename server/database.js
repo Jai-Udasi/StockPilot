@@ -291,6 +291,225 @@ const MIGRATIONS = [
       `);
     },
   },
+  {
+    version: 6,
+    name: 'invoices_payments_returns_and_refunds',
+    apply(db) {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS invoices (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          invoice_number TEXT NOT NULL UNIQUE COLLATE NOCASE,
+          order_id INTEGER NOT NULL REFERENCES orders(id) ON DELETE RESTRICT,
+          customer_id INTEGER REFERENCES customers(id) ON DELETE RESTRICT,
+          order_number TEXT NOT NULL,
+          customer_name TEXT NOT NULL,
+          customer_email TEXT,
+          billing_address TEXT,
+          invoice_date TEXT NOT NULL,
+          due_date TEXT,
+          status TEXT NOT NULL CHECK (status IN ('draft', 'issued', 'partially_paid', 'paid', 'credited', 'void')),
+          subtotal INTEGER NOT NULL CHECK (subtotal >= 0),
+          discount_total INTEGER NOT NULL DEFAULT 0 CHECK (discount_total >= 0),
+          tax_total INTEGER NOT NULL DEFAULT 0 CHECK (tax_total >= 0),
+          total INTEGER NOT NULL CHECK (total >= 0),
+          created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+          updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_invoices_active_order
+          ON invoices(order_id) WHERE status != 'void';
+        CREATE INDEX IF NOT EXISTS idx_invoices_status_date ON invoices(status, invoice_date);
+        CREATE INDEX IF NOT EXISTS idx_invoices_customer_date ON invoices(customer_id, invoice_date);
+
+        CREATE TABLE IF NOT EXISTS invoice_items (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          invoice_id INTEGER NOT NULL REFERENCES invoices(id) ON DELETE RESTRICT,
+          order_item_id INTEGER NOT NULL REFERENCES order_items(id) ON DELETE RESTRICT,
+          product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE RESTRICT,
+          product_name TEXT NOT NULL,
+          sku TEXT NOT NULL,
+          quantity INTEGER NOT NULL CHECK (quantity > 0),
+          unit_price INTEGER NOT NULL CHECK (unit_price >= 0),
+          subtotal INTEGER NOT NULL CHECK (subtotal >= 0),
+          discount_amount INTEGER NOT NULL DEFAULT 0 CHECK (discount_amount >= 0),
+          tax_amount INTEGER NOT NULL DEFAULT 0 CHECK (tax_amount >= 0),
+          total INTEGER NOT NULL CHECK (total >= 0),
+          UNIQUE (invoice_id, order_item_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_invoice_items_invoice ON invoice_items(invoice_id, id);
+        CREATE INDEX IF NOT EXISTS idx_invoice_items_product ON invoice_items(product_id, invoice_id);
+
+        CREATE TABLE IF NOT EXISTS payments (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          invoice_id INTEGER NOT NULL REFERENCES invoices(id) ON DELETE RESTRICT,
+          payment_reference TEXT NOT NULL UNIQUE COLLATE NOCASE,
+          external_reference TEXT UNIQUE COLLATE NOCASE,
+          amount INTEGER NOT NULL CHECK (amount > 0),
+          currency TEXT NOT NULL DEFAULT 'USD' CHECK (currency = 'USD'),
+          method TEXT NOT NULL,
+          status TEXT NOT NULL CHECK (status IN ('completed', 'failed', 'reversed')),
+          payment_date TEXT NOT NULL,
+          notes TEXT,
+          created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+          updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_payments_invoice_status ON payments(invoice_id, status, payment_date);
+
+        CREATE TABLE IF NOT EXISTS sales_returns (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          return_number TEXT NOT NULL UNIQUE COLLATE NOCASE,
+          order_id INTEGER NOT NULL REFERENCES orders(id) ON DELETE RESTRICT,
+          invoice_id INTEGER REFERENCES invoices(id) ON DELETE RESTRICT,
+          customer_id INTEGER REFERENCES customers(id) ON DELETE RESTRICT,
+          customer_name TEXT NOT NULL,
+          return_date TEXT NOT NULL,
+          reason TEXT NOT NULL,
+          status TEXT NOT NULL CHECK (status IN ('draft', 'accepted', 'rejected')),
+          created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+          updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+          completed_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_sales_returns_order_status ON sales_returns(order_id, status, id);
+        CREATE INDEX IF NOT EXISTS idx_sales_returns_invoice_status ON sales_returns(invoice_id, status, id);
+
+        CREATE TABLE IF NOT EXISTS sales_return_items (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          return_id INTEGER NOT NULL REFERENCES sales_returns(id) ON DELETE RESTRICT,
+          order_item_id INTEGER NOT NULL REFERENCES order_items(id) ON DELETE RESTRICT,
+          product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE RESTRICT,
+          product_name TEXT NOT NULL,
+          sku TEXT NOT NULL,
+          quantity INTEGER NOT NULL CHECK (quantity > 0),
+          restockable INTEGER NOT NULL CHECK (restockable IN (0, 1)),
+          restock_reason TEXT NOT NULL,
+          unit_price INTEGER NOT NULL CHECK (unit_price >= 0),
+          refund_eligible_amount INTEGER NOT NULL CHECK (refund_eligible_amount >= 0),
+          created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+          UNIQUE (return_id, order_item_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_sales_return_items_order_item ON sales_return_items(order_item_id, return_id);
+
+        CREATE TABLE IF NOT EXISTS refunds (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          refund_reference TEXT NOT NULL UNIQUE COLLATE NOCASE,
+          return_id INTEGER NOT NULL REFERENCES sales_returns(id) ON DELETE RESTRICT,
+          invoice_id INTEGER NOT NULL REFERENCES invoices(id) ON DELETE RESTRICT,
+          payment_id INTEGER NOT NULL REFERENCES payments(id) ON DELETE RESTRICT,
+          amount INTEGER NOT NULL CHECK (amount > 0),
+          currency TEXT NOT NULL DEFAULT 'USD' CHECK (currency = 'USD'),
+          method TEXT NOT NULL,
+          external_reference TEXT UNIQUE COLLATE NOCASE,
+          status TEXT NOT NULL CHECK (status IN ('requested', 'completed', 'failed')),
+          notes TEXT,
+          created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+          updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+          completed_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_refunds_invoice_status ON refunds(invoice_id, status, id);
+        CREATE INDEX IF NOT EXISTS idx_refunds_return_status ON refunds(return_id, status, id);
+
+        CREATE TRIGGER IF NOT EXISTS invoice_items_insert_draft_only
+        BEFORE INSERT ON invoice_items
+        WHEN (SELECT status FROM invoices WHERE id = NEW.invoice_id) != 'draft'
+        BEGIN
+          SELECT RAISE(ABORT, 'Issued invoice lines are immutable.');
+        END;
+        CREATE TRIGGER IF NOT EXISTS invoice_items_update_draft_only
+        BEFORE UPDATE ON invoice_items
+        WHEN (SELECT status FROM invoices WHERE id = OLD.invoice_id) != 'draft'
+        BEGIN
+          SELECT RAISE(ABORT, 'Issued invoice lines are immutable.');
+        END;
+        CREATE TRIGGER IF NOT EXISTS invoice_items_delete_draft_only
+        BEFORE DELETE ON invoice_items
+        WHEN (SELECT status FROM invoices WHERE id = OLD.invoice_id) != 'draft'
+        BEGIN
+          SELECT RAISE(ABORT, 'Issued invoice lines are immutable.');
+        END;
+        CREATE TRIGGER IF NOT EXISTS invoice_snapshot_immutable
+        BEFORE UPDATE OF invoice_number, order_id, customer_id, order_number, customer_name,
+          customer_email, billing_address, invoice_date, due_date, subtotal, discount_total, tax_total, total
+        ON invoices
+        WHEN OLD.status != 'draft'
+        BEGIN
+          SELECT RAISE(ABORT, 'Issued invoice details are immutable.');
+        END;
+        CREATE TRIGGER IF NOT EXISTS invoice_status_transition
+        BEFORE UPDATE OF status ON invoices
+        WHEN NOT (
+          (OLD.status = 'draft' AND NEW.status IN ('issued', 'void'))
+          OR (OLD.status = 'issued' AND NEW.status IN ('partially_paid', 'paid', 'credited', 'void'))
+          OR (OLD.status = 'partially_paid' AND NEW.status IN ('issued', 'paid', 'credited'))
+          OR (OLD.status = 'paid' AND NEW.status IN ('partially_paid', 'issued', 'credited'))
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'Invalid invoice status transition.');
+        END;
+        CREATE TRIGGER IF NOT EXISTS sales_return_items_draft_only
+        BEFORE INSERT ON sales_return_items
+        WHEN (SELECT status FROM sales_returns WHERE id = NEW.return_id) != 'draft'
+        BEGIN
+          SELECT RAISE(ABORT, 'Submitted return lines are immutable.');
+        END;
+        CREATE TRIGGER IF NOT EXISTS sales_return_items_update_draft_only
+        BEFORE UPDATE ON sales_return_items
+        WHEN (SELECT status FROM sales_returns WHERE id = OLD.return_id) != 'draft'
+        BEGIN
+          SELECT RAISE(ABORT, 'Submitted return lines are immutable.');
+        END;
+        CREATE TRIGGER IF NOT EXISTS sales_return_items_delete_draft_only
+        BEFORE DELETE ON sales_return_items
+        WHEN (SELECT status FROM sales_returns WHERE id = OLD.return_id) != 'draft'
+        BEGIN
+          SELECT RAISE(ABORT, 'Submitted return lines are immutable.');
+        END;
+        CREATE TRIGGER IF NOT EXISTS sales_return_snapshot_immutable
+        BEFORE UPDATE OF return_number, order_id, invoice_id, customer_id, customer_name, return_date, reason
+        ON sales_returns
+        WHEN OLD.status != 'draft'
+        BEGIN
+          SELECT RAISE(ABORT, 'Completed return details are immutable.');
+        END;
+        CREATE TRIGGER IF NOT EXISTS sales_return_status_transition
+        BEFORE UPDATE OF status ON sales_returns
+        WHEN NOT (OLD.status = 'draft' AND NEW.status IN ('accepted', 'rejected'))
+        BEGIN
+          SELECT RAISE(ABORT, 'Invalid sales return status transition.');
+        END;
+        CREATE TRIGGER IF NOT EXISTS payment_transaction_immutable
+        BEFORE UPDATE OF invoice_id, payment_reference, external_reference, amount, currency, method, payment_date, notes
+        ON payments
+        BEGIN
+          SELECT RAISE(ABORT, 'Payment transaction details are immutable.');
+        END;
+        CREATE TRIGGER IF NOT EXISTS payment_status_transition
+        BEFORE UPDATE OF status ON payments
+        WHEN NOT (OLD.status = 'completed' AND NEW.status = 'reversed')
+        BEGIN
+          SELECT RAISE(ABORT, 'Invalid payment status transition.');
+        END;
+        CREATE TRIGGER IF NOT EXISTS payment_cannot_reverse_refunded
+        BEFORE UPDATE OF status ON payments
+        WHEN NEW.status = 'reversed' AND EXISTS (
+          SELECT 1 FROM refunds WHERE payment_id = OLD.id AND status IN ('requested', 'completed')
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'A payment with a refund cannot be reversed.');
+        END;
+        CREATE TRIGGER IF NOT EXISTS refund_transaction_immutable
+        BEFORE UPDATE OF refund_reference, return_id, invoice_id, payment_id, amount, currency, method, external_reference, notes
+        ON refunds
+        BEGIN
+          SELECT RAISE(ABORT, 'Refund transaction details are immutable.');
+        END;
+        CREATE TRIGGER IF NOT EXISTS refund_status_transition
+        BEFORE UPDATE OF status ON refunds
+        WHEN NOT (OLD.status = 'requested' AND NEW.status IN ('completed', 'failed'))
+        BEGIN
+          SELECT RAISE(ABORT, 'Invalid refund status transition.');
+        END;
+      `);
+    },
+  },
 ];
 
 function ensureTableMigrations(db) {
