@@ -2,7 +2,7 @@ import express from 'express';
 import cors from 'cors';
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
-import { createDatabase, ledgerStockMovement } from './database.js';
+import { createDatabase, getStockReconciliationReport, ledgerStockMovement } from './database.js';
 
 const productFields = {
   sku: z.string().trim().min(1).max(40),
@@ -794,16 +794,836 @@ function mapUniqueConflict(error, label) {
   throw error;
 }
 
+const SALES_ANALYTICS_STATUSES = "'confirmed', 'processing', 'shipped', 'delivered'";
+
+function analyticsDateRange(query = {}) {
+  const now = new Date();
+  const toDefault = now.toISOString();
+  const fromDefault = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - 29)).toISOString();
+  const parseBound = (value, field, endOfDay) => {
+    if (value === undefined) return field === 'from' ? fromDefault : toDefault;
+    const dateOnly = typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value);
+    const dateTime = typeof value === 'string'
+      && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?(?:Z|[+-]\d{2}:\d{2})$/.test(value);
+    if (!dateOnly && !dateTime) {
+      throw Object.assign(new Error(`${field} must be an ISO date or datetime.`), { status: 400 });
+    }
+    const calendarDate = new Date(`${value.slice(0, 10)}T00:00:00.000Z`);
+    const timeText = dateTime ? value.slice(11, 19) : '';
+    const [hour, minute, second] = timeText ? timeText.split(':').map(Number) : [0, 0, 0];
+    const parsed = new Date(dateOnly && endOfDay ? `${value}T23:59:59.999Z` : dateOnly ? `${value}T00:00:00.000Z` : value);
+    if (Number.isNaN(parsed.getTime())
+      || calendarDate.toISOString().slice(0, 10) !== value.slice(0, 10)
+      || hour > 23 || minute > 59 || second > 59) {
+      throw Object.assign(new Error(`${field} must be a valid ISO date or datetime.`), { status: 400 });
+    }
+    return parsed.toISOString();
+  };
+  const from = parseBound(query.from, 'from', false);
+  const to = parseBound(query.to, 'to', true);
+  if (from > to) throw Object.assign(new Error('from must be earlier than or equal to to.'), { status: 400 });
+  if (Date.parse(to) - Date.parse(from) > 366 * 24 * 60 * 60 * 1000) {
+    throw Object.assign(new Error('Analytics date ranges cannot exceed 366 days.'), { status: 400 });
+  }
+  return { from, to };
+}
+
+function analyticsLimit(value, fallback, maximum = 100) {
+  if (value === undefined) return fallback;
+  const limit = Number(value);
+  if (!Number.isInteger(limit) || limit < 1 || limit > maximum) {
+    throw Object.assign(new Error(`limit must be an integer between 1 and ${maximum}.`), { status: 400 });
+  }
+  return limit;
+}
+
+function analyticsPeriod(value) {
+  const period = value === undefined ? 'daily' : String(value);
+  if (!['daily', 'weekly', 'monthly'].includes(period)) {
+    throw Object.assign(new Error('period must be daily, weekly, or monthly.'), { status: 400 });
+  }
+  return period;
+}
+
+function analyticsWindowDays(value) {
+  if (value === undefined) return 90;
+  const days = Number(value);
+  if (!Number.isInteger(days) || days < 1 || days > 365) {
+    throw Object.assign(new Error('windowDays must be an integer between 1 and 365.'), { status: 400 });
+  }
+  return days;
+}
+
+function analyticsId(query, key) {
+  const value = query[key];
+  if (value === undefined) return null;
+  if (typeof value !== 'string' || !/^[1-9]\d*$/.test(value) || !Number.isSafeInteger(Number(value))) {
+    throw Object.assign(new Error(`${key} must be a positive integer.`), { status: 400 });
+  }
+  return Number(value);
+}
+
+function analyticsFilters(query = {}) {
+  return {
+    productId: analyticsId(query, 'productId'),
+    categoryId: analyticsId(query, 'categoryId'),
+    supplierId: analyticsId(query, 'supplierId'),
+  };
+}
+
+function productFilterSql(filters, alias = 'p') {
+  const clauses = [];
+  const params = [];
+  if (filters.productId) {
+    clauses.push(`${alias}.id = ?`);
+    params.push(filters.productId);
+  }
+  if (filters.categoryId) {
+    clauses.push(`(${alias}.category_id = ? OR (${alias}.category_id IS NULL AND ${alias}.category = (SELECT name FROM categories WHERE id = ?)))`);
+    params.push(filters.categoryId, filters.categoryId);
+  }
+  if (filters.supplierId) {
+    clauses.push(`${alias}.supplier_id = ?`);
+    params.push(filters.supplierId);
+  }
+  return { sql: clauses.length ? ` AND ${clauses.join(' AND ')}` : '', params };
+}
+
+function inventoryAnalytics(db, filters = {}, windowDays = 90) {
+  const productFilters = productFilterSql(filters);
+  const products = db.prepare(`
+    SELECT p.id, p.sku, p.name, p.quantity, p.low_stock_threshold, p.unit_cost,
+      p.is_active, p.category_id, p.supplier_id,
+      COALESCE(c.name, p.category) AS category_name,
+      s.business_name AS supplier_name,
+      p.price,
+      (SELECT MAX(o.created_at)
+        FROM order_items oi JOIN orders o ON o.id = oi.order_id
+        WHERE oi.product_id = p.id AND ${analyticsSalesStatuses()}) AS last_sold_at
+    FROM products p
+    LEFT JOIN categories c ON c.id = p.category_id
+    LEFT JOIN suppliers s ON s.id = p.supplier_id
+    WHERE p.archived_at IS NULL
+      ${productFilters.sql}
+    ORDER BY p.name COLLATE NOCASE, p.id
+  `).all(...productFilters.params);
+  const reconciliation = new Map(getStockReconciliationReport(db).map((row) => [row.id, row]));
+  const mappedProducts = products.map((row) => {
+    const ledgerQuantity = reconciliation.get(row.id)?.ledger_quantity ?? 0;
+    return ({
+    id: row.id,
+    sku: row.sku,
+    name: row.name,
+    quantity: row.quantity,
+    reorderThreshold: row.low_stock_threshold,
+    unitCost: row.unit_cost === null ? null : row.unit_cost / 100,
+    stockValue: row.quantity * (row.unit_cost ?? 0) / 100,
+    retailValue: row.quantity * row.price / 100,
+    costMissing: row.unit_cost === null,
+    categoryId: row.category_id,
+    category: row.category_name,
+    supplierId: row.supplier_id,
+    supplier: row.supplier_name,
+    isActive: Boolean(row.is_active),
+    ledgerQuantity,
+    reconciled: ledgerQuantity === row.quantity,
+    lastSoldAt: row.last_sold_at,
+    });
+  });
+  const groupBy = (field, idField) => {
+    const groups = new Map();
+    for (const product of mappedProducts) {
+      const label = product[field] || 'Unassigned';
+      const key = product[idField] ?? label;
+      const group = groups.get(key) || {
+        [idField]: product[idField],
+        [field]: label,
+        productCount: 0,
+        unitsInStock: 0,
+        inventoryValue: 0,
+        retailValue: 0,
+        missingCostCount: 0,
+      };
+      group.productCount += 1;
+      group.unitsInStock += product.quantity;
+      group.inventoryValue += product.stockValue;
+      group.retailValue += product.retailValue;
+      if (product.costMissing) group.missingCostCount += 1;
+      groups.set(key, group);
+    }
+    return [...groups.values()].sort((a, b) => a[field].localeCompare(b[field]));
+  };
+  const activeProducts = mappedProducts.filter((product) => product.isActive);
+  const slowMovingBefore = new Date(Date.now() - windowDays * 24 * 60 * 60 * 1000);
+  const stockProducts = activeProducts.filter((product) => product.quantity > 0);
+  const nonMovingProducts = stockProducts.filter((product) => !product.lastSoldAt);
+  const slowMovingProducts = stockProducts.filter((product) => product.lastSoldAt && new Date(product.lastSoldAt) < slowMovingBefore);
+  const reconciliationWarnings = mappedProducts.filter((product) => !product.reconciled).map((product) => ({
+    id: product.id,
+    sku: product.sku,
+    name: product.name,
+    currentQuantity: product.quantity,
+    ledgerQuantity: product.ledgerQuantity,
+  }));
+  return {
+    totalUnitsInStock: mappedProducts.reduce((sum, product) => sum + product.quantity, 0),
+    inventoryValuation: mappedProducts.reduce((sum, product) => sum + product.stockValue, 0),
+    retailValue: mappedProducts.reduce((sum, product) => sum + product.retailValue, 0),
+    activeProductCount: activeProducts.length,
+    lowStockCount: activeProducts.filter((product) => product.quantity <= product.reorderThreshold).length,
+    outOfStockCount: activeProducts.filter((product) => product.quantity === 0).length,
+    negativeStockCount: mappedProducts.filter((product) => product.quantity < 0).length,
+    missingCostCount: mappedProducts.filter((product) => product.costMissing).length,
+    missingCostProducts: mappedProducts.filter((product) => product.costMissing).map(({ id, sku, name, quantity }) => ({ id, sku, name, quantity })),
+    products: mappedProducts,
+    lowStockProducts: activeProducts
+      .filter((product) => product.quantity <= product.reorderThreshold)
+      .sort((a, b) => a.quantity - b.quantity || a.name.localeCompare(b.name)),
+    outOfStockProducts: activeProducts
+      .filter((product) => product.quantity === 0)
+      .sort((a, b) => a.name.localeCompare(b.name)),
+    byCategory: groupBy('category', 'categoryId'),
+    bySupplier: groupBy('supplier', 'supplierId'),
+    reconciliationWarnings,
+    slowMovement: {
+      windowDays,
+      nonMovingCount: nonMovingProducts.length,
+      slowMovingCount: slowMovingProducts.length,
+      nonMovingProducts: nonMovingProducts.map(({ id, sku, name, quantity, stockValue }) => ({ id, sku, name, quantity, stockValue, lastSoldAt: null })),
+      slowMovingProducts: slowMovingProducts.map(({ id, sku, name, quantity, stockValue, lastSoldAt }) => ({ id, sku, name, quantity, stockValue, lastSoldAt })),
+    },
+  };
+}
+
+function analyticsSalesStatuses() {
+  return `status IN (${SALES_ANALYTICS_STATUSES}) AND stock_deducted_at IS NOT NULL`;
+}
+
+function analyticsSalesTrend(db, range, period, filters = {}) {
+  const bucket = period === 'daily'
+    ? "date(o.created_at)"
+    : period === 'weekly'
+      ? "date(o.created_at, '-' || ((CAST(strftime('%w', o.created_at) AS INTEGER) + 6) % 7) || ' days')"
+      : "strftime('%Y-%m-01', o.created_at)";
+  const productFilters = productFilterSql(filters);
+  const hasFilters = Boolean(productFilters.sql);
+  const lineJoin = hasFilters ? 'JOIN order_items oi ON oi.order_id = o.id JOIN products p ON p.id = oi.product_id' : '';
+  const salesValue = hasFilters ? 'SUM(oi.quantity * oi.unit_price)' : 'SUM(o.total)';
+  const distinctOrders = hasFilters ? 'COUNT(DISTINCT o.id)' : 'COUNT(*)';
+  const rows = db.prepare(`
+    SELECT ${bucket} AS period,
+      ${distinctOrders} AS order_count,
+      COALESCE(${salesValue}, 0) AS sales_cents
+    FROM orders o ${lineJoin}
+    WHERE ${analyticsSalesStatuses()} AND o.created_at >= ? AND o.created_at <= ? ${productFilters.sql}
+    GROUP BY period ORDER BY period
+  `).all(range.from, range.to, ...productFilters.params);
+  const values = new Map(rows.map((row) => [row.period, row]));
+  const statusFilter = hasFilters
+    ? ` AND EXISTS (SELECT 1 FROM order_items oi JOIN products p ON p.id = oi.product_id WHERE oi.order_id = o.id ${productFilters.sql})`
+    : '';
+  const statusOrderValue = hasFilters
+    ? `(SELECT COALESCE(SUM(oi.quantity * oi.unit_price), 0)
+      FROM order_items oi JOIN products p ON p.id = oi.product_id
+      WHERE oi.order_id = o.id ${productFilters.sql})`
+    : 'o.total';
+  const statusRows = db.prepare(`
+    SELECT o.status, COUNT(DISTINCT o.id) AS order_count, COALESCE(SUM(${statusOrderValue}), 0) AS sales_cents
+    FROM orders o
+    WHERE o.created_at >= ? AND o.created_at <= ? ${statusFilter}
+    GROUP BY o.status ORDER BY o.status
+  `).all(...(hasFilters
+    ? [...productFilters.params, range.from, range.to, ...productFilters.params]
+    : [range.from, range.to]));
+  const acceptedReturnCredits = db.prepare(`
+    SELECT COALESCE(SUM(sri.refund_eligible_amount), 0) AS amount
+    FROM sales_return_items sri JOIN sales_returns sr ON sr.id = sri.return_id
+    JOIN products p ON p.id = sri.product_id
+    WHERE sr.status = 'accepted' AND sr.return_date >= ? AND sr.return_date <= ? ${productFilters.sql}
+  `).get(range.from, range.to, ...productFilters.params).amount;
+  const categorySales = analyticsSalesByCategory(db, range, filters);
+  const start = new Date(range.from);
+  const end = new Date(range.to);
+  const keyFor = (date) => {
+    if (period === 'daily') return date.toISOString().slice(0, 10);
+    if (period === 'monthly') return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, '0')}-01`;
+    const day = (date.getUTCDay() + 6) % 7;
+    date.setUTCDate(date.getUTCDate() - day);
+    return date.toISOString().slice(0, 10);
+  };
+  const current = new Date(start);
+  if (period === 'weekly') current.setUTCDate(current.getUTCDate() - ((current.getUTCDay() + 6) % 7));
+  if (period === 'monthly') current.setUTCDate(1);
+  const salesTrend = [];
+  while (current <= end) {
+    const key = keyFor(new Date(current));
+    const row = values.get(key);
+    const count = row?.order_count ?? 0;
+    salesTrend.push({
+      period: key,
+      orderCount: count,
+      salesValue: (row?.sales_cents ?? 0) / 100,
+      averageOrderValue: count ? row.sales_cents / count / 100 : 0,
+      acceptedReturnCredits: 0,
+      netSalesValue: (row?.sales_cents ?? 0) / 100,
+    });
+    if (period === 'daily') current.setUTCDate(current.getUTCDate() + 1);
+    else if (period === 'weekly') current.setUTCDate(current.getUTCDate() + 7);
+    else current.setUTCMonth(current.getUTCMonth() + 1);
+  }
+  const creditsByPeriod = db.prepare(`
+    SELECT ${period === 'daily' ? 'date(sr.return_date)' : period === 'monthly' ? "strftime('%Y-%m-01', sr.return_date)" : "date(sr.return_date, '-' || ((CAST(strftime('%w', sr.return_date) AS INTEGER) + 6) % 7) || ' days')"} AS period,
+      COALESCE(SUM(sri.refund_eligible_amount), 0) AS amount
+    FROM sales_returns sr
+    JOIN sales_return_items sri ON sri.return_id = sr.id
+    JOIN products p ON p.id = sri.product_id
+    WHERE sr.status = 'accepted' AND sr.return_date >= ? AND sr.return_date <= ? ${productFilters.sql}
+    GROUP BY period
+  `).all(range.from, range.to, ...productFilters.params);
+  const creditByPeriod = new Map(creditsByPeriod.map((row) => [row.period, row.amount]));
+  for (const point of salesTrend) {
+    point.acceptedReturnCredits = (creditByPeriod.get(point.period) ?? 0) / 100;
+    point.netSalesValue = point.salesValue - point.acceptedReturnCredits;
+  }
+  return {
+    salesTrend,
+    statusBreakdown: statusRows.map((row) => ({
+      status: row.status,
+      orderCount: row.order_count,
+      orderValue: row.sales_cents / 100,
+    })),
+    grossSalesValue: salesTrend.reduce((sum, point) => sum + point.salesValue, 0),
+    acceptedReturnCredits: acceptedReturnCredits / 100,
+    netSalesValue: salesTrend.reduce((sum, point) => sum + point.salesValue, 0) - acceptedReturnCredits / 100,
+    byCategory: categorySales,
+  };
+}
+
+function analyticsSalesByCategory(db, range, filters = {}) {
+  const productFilters = productFilterSql(filters);
+  const sales = db.prepare(`
+    SELECT COALESCE(c.id, 0) AS category_id, COALESCE(c.name, p.category, 'Unassigned') AS category,
+      SUM(oi.quantity) AS units_sold, SUM(oi.quantity * oi.unit_price) AS sales_cents,
+      COUNT(DISTINCT o.id) AS order_count
+    FROM order_items oi JOIN orders o ON o.id = oi.order_id
+    JOIN products p ON p.id = oi.product_id
+    LEFT JOIN categories c ON c.id = p.category_id
+      OR (p.category_id IS NULL AND c.name = p.category COLLATE NOCASE)
+    WHERE ${analyticsSalesStatuses()} AND o.created_at >= ? AND o.created_at <= ? ${productFilters.sql}
+    GROUP BY category_id, category ORDER BY sales_cents DESC, category COLLATE NOCASE
+  `).all(range.from, range.to, ...productFilters.params);
+  const credits = db.prepare(`
+    SELECT COALESCE(c.id, 0) AS category_id, COALESCE(c.name, p.category, 'Unassigned') AS category,
+      COALESCE(SUM(sri.quantity), 0) AS returned_quantity,
+      COALESCE(SUM(sri.refund_eligible_amount), 0) AS credit_cents
+    FROM sales_returns sr JOIN sales_return_items sri ON sri.return_id = sr.id
+    JOIN products p ON p.id = sri.product_id
+    LEFT JOIN categories c ON c.id = p.category_id
+      OR (p.category_id IS NULL AND c.name = p.category COLLATE NOCASE)
+    WHERE sr.status = 'accepted' AND sr.return_date >= ? AND sr.return_date <= ? ${productFilters.sql}
+    GROUP BY category_id, category
+  `).all(range.from, range.to, ...productFilters.params);
+  const creditById = new Map(credits.map((row) => [row.category_id, row]));
+  return sales.map((row) => {
+    const credit = creditById.get(row.category_id);
+    const returnCents = credit?.credit_cents ?? 0;
+    return {
+      categoryId: row.category_id || null,
+      category: row.category,
+      unitsSold: row.units_sold,
+      acceptedReturnQuantity: credit?.returned_quantity ?? 0,
+      netUnitsSold: row.units_sold - (credit?.returned_quantity ?? 0),
+      grossSalesValue: row.sales_cents / 100,
+      acceptedReturnCredits: returnCents / 100,
+      netSalesValue: (row.sales_cents - returnCents) / 100,
+      orderCount: row.order_count,
+    };
+  });
+}
+
+function analyticsTopProducts(db, range, limit, filters = {}) {
+  const productFilters = productFilterSql(filters, 'p');
+  const products = db.prepare(`
+    SELECT oi.product_id, oi.sku, oi.product_name,
+      SUM(oi.quantity) AS units_sold,
+      SUM(oi.quantity * oi.unit_price) AS sales_cents,
+      COUNT(DISTINCT o.id) AS order_count
+    FROM order_items oi
+    JOIN orders o ON o.id = oi.order_id
+    JOIN products p ON p.id = oi.product_id
+    WHERE ${analyticsSalesStatuses()} AND o.created_at >= ? AND o.created_at <= ? ${productFilters.sql}
+    GROUP BY oi.product_id, oi.sku, oi.product_name
+    ORDER BY units_sold DESC, sales_cents DESC, oi.product_name COLLATE NOCASE
+    LIMIT ?
+  `).all(range.from, range.to, ...productFilters.params, limit);
+  const returnedRows = db.prepare(`
+    SELECT sri.product_id, COALESCE(SUM(sri.quantity), 0) AS quantity,
+      COALESCE(SUM(sri.refund_eligible_amount), 0) AS credit_cents
+    FROM sales_returns sr JOIN sales_return_items sri ON sri.return_id = sr.id
+    JOIN products p ON p.id = sri.product_id
+    WHERE sr.status = 'accepted' AND sr.return_date >= ? AND sr.return_date <= ? ${productFilters.sql}
+    GROUP BY sri.product_id
+  `).all(range.from, range.to, ...productFilters.params);
+  const returnsByProduct = new Map(returnedRows.map((row) => [row.product_id, row]));
+  return products.map((row) => {
+    const returned = returnsByProduct.get(row.product_id) || { quantity: 0, credit_cents: 0 };
+    return {
+      productId: row.product_id,
+      sku: row.sku,
+      productName: row.product_name,
+      unitsSold: row.units_sold,
+      acceptedReturnQuantity: returned.quantity,
+      netUnitsSold: row.units_sold - returned.quantity,
+      salesValue: row.sales_cents / 100,
+      acceptedReturnCredits: returned.credit_cents / 100,
+      netSalesValue: (row.sales_cents - returned.credit_cents) / 100,
+      orderCount: row.order_count,
+    };
+  });
+}
+
+function analyticsFinancials(db, range) {
+  const invoicesIssued = db.prepare(`
+    SELECT COALESCE(SUM(total), 0) AS amount FROM invoices
+    WHERE status NOT IN ('draft', 'void') AND invoice_date >= ? AND invoice_date <= ?
+  `).get(range.from, range.to).amount;
+  const paymentsReceived = db.prepare(`
+    SELECT COALESCE(SUM(amount), 0) AS amount FROM payments
+    WHERE status = 'completed' AND payment_date >= ? AND payment_date <= ?
+  `).get(range.from, range.to).amount;
+  const acceptedReturnCredits = db.prepare(`
+    SELECT COALESCE(SUM(sri.refund_eligible_amount), 0) AS amount
+    FROM sales_return_items sri
+    JOIN sales_returns sr ON sr.id = sri.return_id
+    WHERE sr.status = 'accepted' AND sr.return_date >= ? AND sr.return_date <= ?
+  `).get(range.from, range.to).amount;
+  const completedRefunds = db.prepare(`
+    SELECT COALESCE(SUM(amount), 0) AS amount FROM refunds
+    WHERE status = 'completed' AND completed_at >= ? AND completed_at <= ?
+  `).get(range.from, range.to).amount;
+  const outstandingReceivables = db.prepare(`
+    SELECT COALESCE(SUM(MAX(0, i.total
+      - COALESCE((SELECT SUM(p.amount) FROM payments p WHERE p.invoice_id = i.id AND p.status = 'completed'), 0)
+      - COALESCE((SELECT SUM(sri.refund_eligible_amount)
+        FROM sales_return_items sri JOIN sales_returns sr ON sr.id = sri.return_id
+        WHERE sr.invoice_id = i.id AND sr.status = 'accepted'), 0)
+    )), 0) AS amount
+    FROM invoices i WHERE i.status NOT IN ('draft', 'void')
+  `).get().amount;
+  const unsettledReturnCredits = db.prepare(`
+    SELECT COALESCE(SUM(MAX(0, accepted.credit_cents - COALESCE(refunded.refund_cents, 0))), 0) AS amount
+    FROM (
+      SELECT sr.id, SUM(sri.refund_eligible_amount) AS credit_cents
+      FROM sales_returns sr JOIN sales_return_items sri ON sri.return_id = sr.id
+      WHERE sr.status = 'accepted' GROUP BY sr.id
+    ) accepted
+    LEFT JOIN (
+      SELECT return_id, SUM(amount) AS refund_cents
+      FROM refunds WHERE status = 'completed' GROUP BY return_id
+    ) refunded ON refunded.return_id = accepted.id
+  `).get().amount;
+  const invoiceStatusDistribution = db.prepare(`
+    SELECT status, COUNT(*) AS record_count, COALESCE(SUM(total), 0) AS amount
+    FROM invoices WHERE invoice_date >= ? AND invoice_date <= ?
+    GROUP BY status ORDER BY status
+  `).all(range.from, range.to).map((row) => ({
+    status: row.status,
+    count: row.record_count,
+    amount: row.amount / 100,
+  }));
+  const paymentStatusDistribution = db.prepare(`
+    SELECT status, COUNT(*) AS record_count, COALESCE(SUM(amount), 0) AS amount
+    FROM payments WHERE payment_date >= ? AND payment_date <= ?
+    GROUP BY status ORDER BY status
+  `).all(range.from, range.to).map((row) => ({
+    status: row.status,
+    count: row.record_count,
+    amount: row.amount / 100,
+  }));
+  return {
+    invoicesIssued: invoicesIssued / 100,
+    paymentsReceived: paymentsReceived / 100,
+    acceptedReturnCredits: acceptedReturnCredits / 100,
+    completedRefunds: completedRefunds / 100,
+    netCashRetained: (paymentsReceived - completedRefunds) / 100,
+    unsettledReturnCredits: unsettledReturnCredits / 100,
+    outstandingReceivables: outstandingReceivables / 100,
+    invoiceStatusDistribution,
+    paymentStatusDistribution,
+  };
+}
+
+function analyticsPeriodKey(value, period) {
+  const date = new Date(value);
+  if (period === 'monthly') return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, '0')}-01`;
+  if (period === 'weekly') date.setUTCDate(date.getUTCDate() - ((date.getUTCDay() + 6) % 7));
+  return date.toISOString().slice(0, 10);
+}
+
+function analyticsPeriodSeries(range, period, rows) {
+  const values = new Map(rows.map((row) => [row.period, row]));
+  const start = new Date(range.from);
+  const end = new Date(range.to);
+  const current = new Date(start);
+  if (period === 'weekly') current.setUTCDate(current.getUTCDate() - ((current.getUTCDay() + 6) % 7));
+  if (period === 'monthly') current.setUTCDate(1);
+  const series = [];
+  while (current <= end) {
+    const key = analyticsPeriodKey(current.toISOString(), period);
+    const value = values.get(key);
+    series.push({ period: key, ...(value || {}) });
+    if (period === 'daily') current.setUTCDate(current.getUTCDate() + 1);
+    else if (period === 'weekly') current.setUTCDate(current.getUTCDate() + 7);
+    else current.setUTCMonth(current.getUTCMonth() + 1);
+  }
+  return series;
+}
+
+function analyticsReceivingTrend(db, range, period, filters = {}) {
+  const productFilters = productFilterSql(filters, 'p');
+  const receiptFilters = ['gr.received_at >= ?', 'gr.received_at <= ?'];
+  const params = [range.from, range.to];
+  if (filters.supplierId) {
+    receiptFilters.push('gr.supplier_id = ?');
+    params.push(filters.supplierId);
+  }
+  if (productFilters.sql) {
+    receiptFilters.push(`1 = 1 ${productFilters.sql}`);
+    params.push(...productFilters.params);
+  }
+  const bucket = period === 'daily'
+    ? 'date(gr.received_at)'
+    : period === 'weekly'
+      ? "date(gr.received_at, '-' || ((CAST(strftime('%w', gr.received_at) AS INTEGER) + 6) % 7) || ' days')"
+      : "strftime('%Y-%m-01', gr.received_at)";
+  const rows = db.prepare(`
+    SELECT ${bucket} AS period,
+      COUNT(DISTINCT gr.id) AS receiptCount,
+      COALESCE(SUM(gri.quantity), 0) AS receivedQuantity,
+      COALESCE(SUM(gri.quantity * gri.unit_cost), 0) AS receivedCents
+    FROM goods_receipts gr
+    JOIN goods_receipt_items gri ON gri.goods_receipt_id = gr.id
+    JOIN products p ON p.id = gri.product_id
+    WHERE ${receiptFilters.join(' AND ')}
+    GROUP BY period ORDER BY period
+  `).all(...params);
+  return analyticsPeriodSeries(range, period, rows).map((row) => ({
+    period: row.period,
+    receiptCount: row.receiptCount || 0,
+    receivedQuantity: row.receivedQuantity || 0,
+    receivedValue: (row.receivedCents || 0) / 100,
+  }));
+}
+
+function analyticsReturnsRefunds(db, range) {
+  const returns = db.prepare(`
+    SELECT sr.status, COUNT(DISTINCT sr.id) AS return_count,
+      COALESCE(SUM(CASE WHEN sr.status = 'accepted' THEN item_totals.quantity ELSE 0 END), 0) AS accepted_quantity,
+      COALESCE(SUM(CASE WHEN sr.status = 'accepted' THEN item_totals.credit_cents ELSE 0 END), 0) AS accepted_credit_cents
+    FROM sales_returns sr
+    LEFT JOIN (
+      SELECT return_id, SUM(quantity) AS quantity, SUM(refund_eligible_amount) AS credit_cents
+      FROM sales_return_items GROUP BY return_id
+    ) item_totals ON item_totals.return_id = sr.id
+    WHERE sr.return_date >= ? AND sr.return_date <= ?
+    GROUP BY sr.status ORDER BY sr.status
+  `).all(range.from, range.to);
+  const refunds = db.prepare(`
+    SELECT status, COUNT(*) AS refund_count, COALESCE(SUM(amount), 0) AS amount
+    FROM refunds WHERE created_at >= ? AND created_at <= ?
+    GROUP BY status ORDER BY status
+  `).all(range.from, range.to);
+  const acceptedCredits = returns.reduce((sum, row) => sum + row.accepted_credit_cents, 0);
+  return {
+    returns: {
+      byStatus: returns.map((row) => ({
+        status: row.status,
+        count: row.return_count,
+        acceptedQuantity: row.accepted_quantity,
+        acceptedCredit: row.accepted_credit_cents / 100,
+      })),
+      acceptedReturnCount: returns.find((row) => row.status === 'accepted')?.return_count ?? 0,
+      acceptedQuantity: returns.find((row) => row.status === 'accepted')?.accepted_quantity ?? 0,
+      acceptedReturnCredits: acceptedCredits / 100,
+    },
+    refunds: {
+      byStatus: refunds.map((row) => ({ status: row.status, count: row.refund_count, amount: row.amount / 100 })),
+      requestedAmount: (refunds.find((row) => row.status === 'requested')?.amount ?? 0) / 100,
+      completedAmount: (refunds.find((row) => row.status === 'completed')?.amount ?? 0) / 100,
+      failedAmount: (refunds.find((row) => row.status === 'failed')?.amount ?? 0) / 100,
+    },
+    dateBasis: {
+      returns: 'return_date; accepted credit is from return-item refund-eligible snapshots.',
+      refunds: 'refund created_at for status distribution; completed refund flow uses completed_at in financials.',
+    },
+  };
+}
+
+function analyticsRecentSales(db, range, limit, filters = {}) {
+  const productFilters = productFilterSql(filters, 'p');
+  const matchingProduct = productFilters.sql
+    ? ` AND EXISTS (
+      SELECT 1 FROM order_items oi JOIN products p ON p.id = oi.product_id
+      WHERE oi.order_id = o.id ${productFilters.sql}
+    )`
+    : '';
+  const orders = db.prepare(`
+    SELECT o.* FROM orders o
+    WHERE ${analyticsSalesStatuses()} AND o.created_at >= ? AND o.created_at <= ? ${matchingProduct}
+    ORDER BY o.created_at DESC, o.id DESC LIMIT ?
+  `).all(range.from, range.to, ...productFilters.params, limit);
+  const getItems = db.prepare('SELECT * FROM order_items WHERE order_id = ? ORDER BY id');
+  return orders.map((order) => mapOrder(order, getItems.all(order.id)));
+}
+
+function analyticsPurchasing(db, range, period, filters = {}) {
+  const productFilters = productFilterSql({ ...filters, supplierId: null }, 'p');
+  const orderFilters = [
+    "po.status IN ('ordered', 'partially_received', 'received')",
+    'po.created_at >= ?',
+    'po.created_at <= ?',
+  ];
+  const orderParams = [range.from, range.to];
+  if (filters.supplierId) {
+    orderFilters.push('po.supplier_id = ?');
+    orderParams.push(filters.supplierId);
+  }
+  if (productFilters.sql) {
+    orderFilters.push(`EXISTS (
+      SELECT 1 FROM purchase_order_items match_item
+      JOIN products p ON p.id = match_item.product_id
+      WHERE match_item.purchase_order_id = po.id ${productFilters.sql}
+    )`);
+    orderParams.push(...productFilters.params);
+  }
+  const orderRows = db.prepare(`
+    SELECT po.id, po.supplier_id, s.supplier_code, s.business_name, po.status,
+      po.created_at, po.submitted_at, po.total,
+      COALESCE((SELECT SUM(poi.line_total) FROM purchase_order_items poi
+        JOIN products p ON p.id = poi.product_id
+        WHERE poi.purchase_order_id = po.id ${productFilters.sql}), 0) AS filtered_total,
+      COALESCE((SELECT SUM(poi.ordered_quantity) FROM purchase_order_items poi
+        JOIN products p ON p.id = poi.product_id
+        WHERE poi.purchase_order_id = po.id ${productFilters.sql}), 0) AS ordered_quantity,
+      COALESCE((SELECT SUM(poi.received_quantity) FROM purchase_order_items poi
+        JOIN products p ON p.id = poi.product_id
+        WHERE poi.purchase_order_id = po.id ${productFilters.sql}), 0) AS received_quantity,
+      COALESCE((SELECT SUM(poi.ordered_quantity - poi.received_quantity) FROM purchase_order_items poi
+        JOIN products p ON p.id = poi.product_id
+        WHERE poi.purchase_order_id = po.id ${productFilters.sql}), 0) AS outstanding_quantity,
+      (SELECT MIN(received_at) FROM goods_receipts gr WHERE gr.purchase_order_id = po.id) AS first_received_at
+    FROM purchase_orders po JOIN suppliers s ON s.id = po.supplier_id
+    WHERE ${orderFilters.join(' AND ')}
+    ORDER BY po.created_at, po.id
+  `).all(
+    ...(productFilters.sql ? [
+      ...productFilters.params,
+      ...productFilters.params,
+      ...productFilters.params,
+      ...productFilters.params,
+      ...orderParams,
+    ] : orderParams),
+  ).map((row) => ({
+    ...row,
+    orderedCents: productFilters.sql ? row.filtered_total : row.total,
+  }));
+  const receiptFilters = ['gr.received_at >= ?', 'gr.received_at <= ?'];
+  const receiptParams = [range.from, range.to];
+  if (filters.supplierId) {
+    receiptFilters.push('gr.supplier_id = ?');
+    receiptParams.push(filters.supplierId);
+  }
+  if (productFilters.sql) {
+    receiptFilters.push(`p.id IS NOT NULL ${productFilters.sql}`);
+    receiptParams.push(...productFilters.params);
+  }
+  const receiptRows = db.prepare(`
+    SELECT gr.supplier_id, s.supplier_code, s.business_name,
+      gri.quantity, gri.unit_cost, gr.received_at
+    FROM goods_receipts gr
+    JOIN suppliers s ON s.id = gr.supplier_id
+    JOIN goods_receipt_items gri ON gri.goods_receipt_id = gr.id
+    JOIN products p ON p.id = gri.product_id
+    WHERE ${receiptFilters.join(' AND ')}
+  `).all(...receiptParams);
+  const supplierMap = new Map();
+  const getSupplier = (id, code, name) => {
+    if (!supplierMap.has(id)) {
+      supplierMap.set(id, {
+        supplierId: id,
+        supplierCode: code,
+        supplierName: name,
+        purchaseOrderCount: 0,
+        orderedCents: 0,
+        orderedQuantity: 0,
+        receivedCents: 0,
+        receivedQuantity: 0,
+        fullyReceivedOrderCount: 0,
+        receiptLeadDaysTotal: 0,
+        receiptLeadCount: 0,
+      });
+    }
+    return supplierMap.get(id);
+  };
+  for (const row of orderRows) {
+    const supplier = getSupplier(row.supplier_id, row.supplier_code, row.business_name);
+    supplier.purchaseOrderCount += 1;
+    supplier.orderedCents += row.orderedCents;
+    supplier.orderedQuantity += row.ordered_quantity;
+    supplier.receivedQuantity += row.received_quantity;
+    if (row.status === 'received') supplier.fullyReceivedOrderCount += 1;
+    if (row.first_received_at && row.submitted_at) {
+      supplier.receiptLeadDaysTotal += (Date.parse(row.first_received_at) - Date.parse(row.submitted_at)) / 86_400_000;
+      supplier.receiptLeadCount += 1;
+    }
+  }
+  for (const row of receiptRows) {
+    const supplier = getSupplier(row.supplier_id, row.supplier_code, row.business_name);
+    supplier.receivedCents += row.quantity * row.unit_cost;
+    supplier.receivedValueQuantity = (supplier.receivedValueQuantity || 0) + row.quantity;
+  }
+  const bucketKey = (dateValue) => {
+    const date = new Date(dateValue);
+    if (period === 'monthly') return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, '0')}-01`;
+    if (period === 'weekly') {
+      date.setUTCDate(date.getUTCDate() - ((date.getUTCDay() + 6) % 7));
+    }
+    return date.toISOString().slice(0, 10);
+  };
+  const trends = new Map();
+  for (const row of orderRows) {
+    const key = bucketKey(row.created_at);
+    const entry = trends.get(key) || { period: key, orderCount: 0, orderedCents: 0 };
+    entry.orderCount += 1;
+    entry.orderedCents += row.orderedCents;
+    trends.set(key, entry);
+  }
+  const start = new Date(range.from);
+  const end = new Date(range.to);
+  const trend = [];
+  const current = new Date(start);
+  if (period === 'weekly') current.setUTCDate(current.getUTCDate() - ((current.getUTCDay() + 6) % 7));
+  if (period === 'monthly') current.setUTCDate(1);
+  while (current <= end) {
+    const key = period === 'monthly'
+      ? `${current.getUTCFullYear()}-${String(current.getUTCMonth() + 1).padStart(2, '0')}-01`
+      : current.toISOString().slice(0, 10);
+    const row = trends.get(key);
+    trend.push({
+      period: key,
+      orderCount: row?.orderCount ?? 0,
+      orderedValue: (row?.orderedCents ?? 0) / 100,
+      purchaseValue: (row?.orderedCents ?? 0) / 100,
+    });
+    if (period === 'daily') current.setUTCDate(current.getUTCDate() + 1);
+    else if (period === 'weekly') current.setUTCDate(current.getUTCDate() + 7);
+    else current.setUTCMonth(current.getUTCMonth() + 1);
+  }
+  const suppliers = [...supplierMap.values()].map((supplier) => ({
+    supplierId: supplier.supplierId,
+    supplierCode: supplier.supplierCode,
+    supplierName: supplier.supplierName,
+    purchaseOrderCount: supplier.purchaseOrderCount,
+    orderedValue: supplier.orderedCents / 100,
+    orderedQuantity: supplier.orderedQuantity,
+    receivedValue: supplier.receivedCents / 100,
+    receivedQuantity: supplier.receivedValueQuantity || 0,
+    outstandingQuantity: Math.max(0, supplier.orderedQuantity - supplier.receivedQuantity),
+    fullyReceivedOrderCount: supplier.fullyReceivedOrderCount,
+    averageDaysToFirstReceipt: supplier.receiptLeadCount
+      ? Number((supplier.receiptLeadDaysTotal / supplier.receiptLeadCount).toFixed(2))
+      : null,
+  })).sort((a, b) => b.orderedValue - a.orderedValue || a.supplierName.localeCompare(b.supplierName));
+  const orderSummary = orderRows.reduce((summary, row) => ({
+    purchaseOrderCount: summary.purchaseOrderCount + 1,
+    orderedCents: summary.orderedCents + row.orderedCents,
+    orderedQuantity: summary.orderedQuantity + row.ordered_quantity,
+    outstandingQuantity: summary.outstandingQuantity + row.outstanding_quantity,
+  }), { purchaseOrderCount: 0, orderedCents: 0, orderedQuantity: 0, outstandingQuantity: 0 });
+  const receivedSummary = receiptRows.reduce((summary, row) => ({
+    receivedCents: summary.receivedCents + row.quantity * row.unit_cost,
+    receivedQuantity: summary.receivedQuantity + row.quantity,
+  }), { receivedCents: 0, receivedQuantity: 0 });
+  const receivingTrend = analyticsReceivingTrend(db, range, period, filters);
+  return {
+    purchaseOrderCount: orderSummary.purchaseOrderCount,
+    orderedValue: orderSummary.orderedCents / 100,
+    orderedQuantity: orderSummary.orderedQuantity,
+    receivedValue: receivedSummary.receivedCents / 100,
+    receivedQuantity: receivedSummary.receivedQuantity,
+    outstandingQuantity: orderSummary.outstandingQuantity,
+    purchaseTrend: trend,
+    receivingTrend,
+    suppliers,
+  };
+}
+
+function analyticsStockMovements(db, range, limit, filters = {}) {
+  const productFilters = productFilterSql(filters, 'p');
+  const byPeriodAndType = db.prepare(`
+    SELECT date(sm.created_at) AS period, sm.movement_type,
+      COUNT(*) AS movement_count,
+      COALESCE(SUM(CASE WHEN sm.quantity_delta > 0 THEN sm.quantity_delta ELSE 0 END), 0) AS inbound_quantity,
+      COALESCE(SUM(CASE WHEN sm.quantity_delta < 0 THEN -sm.quantity_delta ELSE 0 END), 0) AS outbound_quantity,
+      COALESCE(SUM(CASE WHEN sm.movement_type = 'adjustment' THEN sm.quantity_delta ELSE 0 END), 0) AS adjustment_net
+    FROM stock_movements sm JOIN products p ON p.id = sm.product_id
+    WHERE sm.created_at >= ? AND sm.created_at <= ? ${productFilters.sql}
+    GROUP BY date(sm.created_at), sm.movement_type
+    ORDER BY period, movement_type
+  `).all(range.from, range.to, ...productFilters.params);
+  const recentMovements = db.prepare(`
+    SELECT sm.*, p.name AS product_name, p.sku
+    FROM stock_movements sm JOIN products p ON p.id = sm.product_id
+    WHERE sm.created_at >= ? AND sm.created_at <= ? ${productFilters.sql}
+    ORDER BY sm.created_at DESC, sm.id DESC LIMIT ?
+  `).all(range.from, range.to, ...productFilters.params, limit).map(mapStockMovement);
+  return { byPeriodAndType, recentMovements };
+}
+
+function csvCell(value) {
+  const text = String(value ?? '');
+  const safe = typeof value === 'string' && /^[\s\uFEFF]*[=+\-@]/.test(text) ? `'${text}` : text;
+  return `"${safe.replaceAll('"', '""')}"`;
+}
+
+function csvResponse(res, filename, headers, rows) {
+  const body = [headers, ...rows].map((row) => row.map(csvCell).join(',')).join('\r\n');
+  res.set({
+    'Content-Type': 'text/csv; charset=utf-8',
+    'Content-Disposition': `attachment; filename="${filename}"`,
+    'Cache-Control': 'no-store',
+  }).send(`${body}\r\n`);
+}
+
 export function createApp({
   db = createDatabase(),
+  corsOrigins = process.env.CORS_ORIGINS,
   authorizeStockAdjustment = (req) => {
     const token = process.env.STOCK_ADJUSTMENT_TOKEN;
     return Boolean(token) && req.get('authorization') === `Bearer ${token}`;
   },
 } = {}) {
   const app = express();
+  const allowedOrigins = new Set(
+    (corsOrigins === undefined
+      ? ['http://localhost:5173', 'http://127.0.0.1:5173']
+      : String(corsOrigins).split(','))
+      .map((origin) => origin.trim())
+      .filter(Boolean),
+  );
   app.disable('x-powered-by');
-  app.use(cors());
+  app.use((req, res, next) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('X-Frame-Options', 'DENY');
+    res.setHeader('Referrer-Policy', 'no-referrer');
+    res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+    next();
+  });
+  app.use(cors({
+    origin(origin, callback) {
+      callback(null, !origin || allowedOrigins.has(origin));
+    },
+  }));
   app.use(express.json({ limit: '100kb' }));
 
   app.get('/api/health', (_req, res) => res.json({ status: 'ok' }));
@@ -1103,6 +1923,328 @@ export function createApp({
       lowStockProducts,
       recentOrders,
     });
+  });
+
+  app.get('/api/analytics/overview', (req, res) => {
+    const range = analyticsDateRange(req.query);
+    const period = analyticsPeriod(req.query.period);
+    const filters = analyticsFilters(req.query);
+    const recentLimit = analyticsLimit(req.query.recentLimit, 5);
+    const inventory = inventoryAnalytics(db, filters, analyticsWindowDays(req.query.windowDays));
+    const sales = analyticsSalesTrend(db, range, period, filters);
+    const purchasing = analyticsPurchasing(db, range, period, filters);
+    const movements = analyticsStockMovements(db, range, recentLimit, filters);
+    const orderCount = sales.salesTrend.reduce((sum, row) => sum + row.orderCount, 0);
+    res.json({
+      dateRange: range,
+      inventory: {
+        totalProductCount: inventory.products.length,
+        activeProductCount: inventory.activeProductCount,
+        totalUnitsInStock: inventory.totalUnitsInStock,
+        inventoryValuation: inventory.inventoryValuation,
+        retailValue: inventory.retailValue,
+        missingCostCount: inventory.missingCostCount,
+        lowStockCount: inventory.lowStockCount,
+        outOfStockCount: inventory.outOfStockCount,
+        negativeStockCount: inventory.negativeStockCount,
+        reconciliationWarningCount: inventory.reconciliationWarnings.length,
+        slowMovement: inventory.slowMovement,
+      },
+      sales: {
+        orderCount,
+        salesValue: sales.grossSalesValue,
+        grossSalesValue: sales.grossSalesValue,
+        averageOrderValue: orderCount ? sales.grossSalesValue / orderCount : 0,
+        acceptedReturnCredits: sales.acceptedReturnCredits,
+        netSalesValue: sales.netSalesValue,
+        statusBreakdown: sales.statusBreakdown,
+        byCategory: sales.byCategory,
+        recentSales: analyticsRecentSales(db, range, recentLimit, filters),
+      },
+      purchasing,
+      financials: analyticsFinancials(db, range),
+      returnsAndRefunds: analyticsReturnsRefunds(db, range),
+      recentStockMovements: movements.recentMovements,
+    });
+  });
+
+  app.get('/api/analytics/inventory', (req, res) => {
+    const filters = analyticsFilters(req.query);
+    const inventory = inventoryAnalytics(db, filters, analyticsWindowDays(req.query.windowDays));
+    res.json({
+      dateBasis: 'Current stock state; inactive products remain in valuation and unit totals while restock alerts include active products only.',
+      valuationBasis: 'Cost value is quantity multiplied by recorded unit cost; retail value is quantity multiplied by current selling price. Missing costs are counted separately and contribute zero to cost valuation.',
+      reconciliationBasis: 'Current product quantity is compared with the latest stock ledger resulting quantity, matching the existing reconciliation report.',
+      slowMovementBasis: 'Active products with positive stock are non-moving if they have no qualifying sale history, or slow-moving if their last qualifying sale predates the configured window.',
+      filters,
+      ...inventory,
+    });
+  });
+
+  app.get('/api/analytics/sales-trend', (req, res) => {
+    const range = analyticsDateRange(req.query);
+    const period = analyticsPeriod(req.query.period);
+    const filters = analyticsFilters(req.query);
+    const result = analyticsSalesTrend(db, range, period, filters);
+    res.json({
+      dateRange: range,
+      period,
+      filters,
+      includedStatuses: ['confirmed', 'processing', 'shipped', 'delivered'],
+      dateBasis: 'Sales order created_at; only stock-deducted orders are included.',
+      returnBasis: 'Accepted return credits are grouped by return_date and shown separately; netSalesValue is gross sales less those credits within the selected date range.',
+      ...result,
+    });
+  });
+
+  app.get('/api/analytics/top-products', (req, res) => {
+    const range = analyticsDateRange(req.query);
+    const limit = analyticsLimit(req.query.limit, 10);
+    const filters = analyticsFilters(req.query);
+    res.json({
+      dateRange: range,
+      filters,
+      includedStatuses: ['confirmed', 'processing', 'shipped', 'delivered'],
+      products: analyticsTopProducts(db, range, limit, filters),
+    });
+  });
+
+  app.get('/api/analytics/purchasing', (req, res) => {
+    const range = analyticsDateRange(req.query);
+    const period = analyticsPeriod(req.query.period);
+    const filters = analyticsFilters(req.query);
+    res.json({
+      dateRange: range,
+      period,
+      filters,
+      dateBasis: {
+        orderedValue: 'Submitted purchase-order totals use purchase order created_at.',
+        receivedValue: 'Received value and quantity use immutable receipt lines and goods receipt received_at.',
+        deliveryTime: 'Average days from purchase-order submitted_at to first goods receipt; no promised delivery date exists in the schema.',
+      },
+      ...analyticsPurchasing(db, range, period, filters),
+    });
+  });
+
+  app.get('/api/analytics/recent-sales', (req, res) => {
+    const range = analyticsDateRange(req.query);
+    const limit = analyticsLimit(req.query.limit, 10);
+    const filters = analyticsFilters(req.query);
+    res.json({
+      dateRange: range,
+      limit,
+      includedStatuses: ['confirmed', 'processing', 'shipped', 'delivered'],
+      dateBasis: 'Sales order created_at; only stock-deducted orders are included.',
+      orders: analyticsRecentSales(db, range, limit, filters),
+    });
+  });
+
+  app.get('/api/analytics/out-of-stock', (req, res) => {
+    const filters = analyticsFilters(req.query);
+    const inventory = inventoryAnalytics(db, filters);
+    res.json({
+      dateBasis: 'Current stock state; archived products and inactive products are excluded from this operational alert.',
+      total: inventory.outOfStockProducts.length,
+      products: inventory.outOfStockProducts,
+    });
+  });
+
+  app.get('/api/analytics/returns-refunds', (req, res) => {
+    const range = analyticsDateRange(req.query);
+    res.json({
+      dateRange: range,
+      ...analyticsReturnsRefunds(db, range),
+    });
+  });
+
+  app.get('/api/analytics/status-distribution', (req, res) => {
+    const range = analyticsDateRange(req.query);
+    const period = analyticsPeriod(req.query.period);
+    const filters = analyticsFilters(req.query);
+    const sales = analyticsSalesTrend(db, range, period, filters);
+    const financials = analyticsFinancials(db, range);
+    const returnsAndRefunds = analyticsReturnsRefunds(db, range);
+    res.json({
+      dateRange: range,
+      orderStatusDistribution: sales.statusBreakdown,
+      invoiceStatusDistribution: financials.invoiceStatusDistribution,
+      paymentStatusDistribution: financials.paymentStatusDistribution,
+      returnStatusDistribution: returnsAndRefunds.returns.byStatus,
+      refundStatusDistribution: returnsAndRefunds.refunds.byStatus,
+    });
+  });
+
+  app.get('/api/analytics/financials', (req, res) => {
+    const range = analyticsDateRange(req.query);
+    res.json({
+      dateRange: range,
+      dateBasis: {
+        invoicesIssued: 'invoice_date for non-draft, non-void invoices',
+        paymentsReceived: 'payment_date for payments currently in completed status',
+        acceptedReturnCredits: 'return_date for accepted return lines',
+        completedRefunds: 'completed_at for refunds currently in completed status',
+        netCashRetained: 'Completed payments by payment_date less completed refunds by completed_at; both are date-filtered independently.',
+        unsettledReturnCredits: 'Current accepted return credits less completed refunds grouped by return; not date-filtered.',
+        outstandingReceivables: 'Current balance across all non-draft, non-void invoices; not date-filtered.',
+      },
+      ...analyticsFinancials(db, range),
+    });
+  });
+
+  app.get('/api/analytics/stock-movements', (req, res) => {
+    const range = analyticsDateRange(req.query);
+    const limit = analyticsLimit(req.query.limit, 20);
+    const filters = analyticsFilters(req.query);
+    const movements = analyticsStockMovements(db, range, limit, filters);
+    res.json({
+      dateRange: range,
+      filters,
+      movementsByPeriodAndType: movements.byPeriodAndType,
+      recentMovements: movements.recentMovements,
+    });
+  });
+
+  app.get('/api/analytics/exports/:dataset.csv', (req, res) => {
+    const range = analyticsDateRange(req.query);
+    const limit = analyticsLimit(req.query.limit, 10_000, 10_000);
+    const filters = analyticsFilters(req.query);
+    const failLargeExport = () => {
+      const error = new Error(`Export exceeds the ${limit.toLocaleString()} row limit; narrow the date range or increase limit.`);
+      error.status = 400;
+      throw error;
+    };
+    const dated = `${range.from.slice(0, 10)}-to-${range.to.slice(0, 10)}`;
+    if (req.params.dataset === 'inventory') {
+      const rows = inventoryAnalytics(db, filters, analyticsWindowDays(req.query.windowDays)).products;
+      if (rows.length > limit) return failLargeExport();
+      return csvResponse(res, `inventory-valuation-${dated}.csv`,
+        ['SKU', 'Product', 'Category', 'Supplier', 'Quantity', 'Reorder threshold', 'Unit cost', 'Cost value', 'Retail value', 'Cost missing', 'Ledger quantity', 'Active'],
+        rows.map((row) => [row.sku, row.name, row.category, row.supplier, row.quantity, row.reorderThreshold, row.unitCost, row.stockValue, row.retailValue, row.costMissing, row.ledgerQuantity, row.isActive]));
+    }
+    if (req.params.dataset === 'low-stock') {
+      const rows = inventoryAnalytics(db, filters, analyticsWindowDays(req.query.windowDays)).lowStockProducts;
+      if (rows.length > limit) return failLargeExport();
+      return csvResponse(res, `low-stock-products-${dated}.csv`,
+        ['SKU', 'Product', 'Category', 'Supplier', 'Quantity', 'Reorder threshold', 'Unit cost', 'Stock value'],
+        rows.map((row) => [row.sku, row.name, row.category, row.supplier, row.quantity, row.reorderThreshold, row.unitCost, row.stockValue]));
+    }
+    if (req.params.dataset === 'out-of-stock') {
+      const rows = inventoryAnalytics(db, filters).outOfStockProducts;
+      if (rows.length > limit) return failLargeExport();
+      return csvResponse(res, `out-of-stock-products-${dated}.csv`,
+        ['SKU', 'Product', 'Category', 'Supplier', 'Quantity', 'Reorder threshold', 'Unit cost', 'Cost value'],
+        rows.map((row) => [row.sku, row.name, row.category, row.supplier, row.quantity, row.reorderThreshold, row.unitCost, row.stockValue]));
+    }
+    if (req.params.dataset === 'top-products') {
+      const rows = analyticsTopProducts(db, range, limit + 1, filters);
+      if (rows.length > limit) return failLargeExport();
+      return csvResponse(res, `top-selling-products-${dated}.csv`,
+        ['SKU', 'Product', 'Units sold', 'Accepted return quantity', 'Net units sold', 'Gross sales value', 'Accepted return credits', 'Net sales value', 'Qualifying orders'],
+        rows.map((row) => [row.sku, row.productName, row.unitsSold, row.acceptedReturnQuantity, row.netUnitsSold, row.salesValue, row.acceptedReturnCredits, row.netSalesValue, row.orderCount]));
+    }
+    if (req.params.dataset === 'sales-trend') {
+      const period = analyticsPeriod(req.query.period);
+      const rows = analyticsSalesTrend(db, range, period, filters).salesTrend;
+      if (rows.length > limit) return failLargeExport();
+      return csvResponse(res, `sales-trend-${period}-${dated}.csv`,
+        ['Period', 'Qualifying orders', 'Gross sales value', 'Accepted return credits', 'Net sales value', 'Average order value'],
+        rows.map((row) => [row.period, row.orderCount, row.salesValue, row.acceptedReturnCredits, row.netSalesValue, row.averageOrderValue]));
+    }
+    if (req.params.dataset === 'sales-by-category') {
+      const rows = analyticsSalesByCategory(db, range, filters);
+      if (rows.length > limit) return failLargeExport();
+      return csvResponse(res, `sales-by-category-${dated}.csv`,
+        ['Category', 'Units sold', 'Accepted return quantity', 'Net units sold', 'Gross sales value', 'Accepted return credits', 'Net sales value', 'Orders'],
+        rows.map((row) => [row.category, row.unitsSold, row.acceptedReturnQuantity, row.netUnitsSold, row.grossSalesValue, row.acceptedReturnCredits, row.netSalesValue, row.orderCount]));
+    }
+    if (req.params.dataset === 'sales-summary') {
+      const sales = analyticsSalesTrend(db, range, analyticsPeriod(req.query.period), filters);
+      const rows = [
+        ['Gross sales', sales.grossSalesValue],
+        ['Accepted return credits', sales.acceptedReturnCredits],
+        ['Net sales after accepted return credits', sales.netSalesValue],
+        ...sales.statusBreakdown.map((row) => [`Orders with status ${row.status}`, row.orderValue]),
+      ];
+      if (rows.length > limit) return failLargeExport();
+      return csvResponse(res, `sales-summary-${dated}.csv`, ['Metric', 'Value'], rows);
+    }
+    if (req.params.dataset === 'supplier-purchases') {
+      const purchasing = analyticsPurchasing(db, range, analyticsPeriod(req.query.period), filters);
+      if (purchasing.suppliers.length > limit) return failLargeExport();
+      return csvResponse(res, `supplier-purchases-${dated}.csv`,
+        ['Supplier code', 'Supplier', 'Purchase orders', 'Ordered value', 'Ordered quantity', 'Received value', 'Received quantity', 'Outstanding quantity', 'Fully received orders', 'Average days to first receipt'],
+        purchasing.suppliers.map((row) => [row.supplierCode, row.supplierName, row.purchaseOrderCount, row.orderedValue, row.orderedQuantity, row.receivedValue, row.receivedQuantity, row.outstandingQuantity, row.fullyReceivedOrderCount, row.averageDaysToFirstReceipt]));
+    }
+    if (req.params.dataset === 'purchases-by-supplier') {
+      const purchasing = analyticsPurchasing(db, range, analyticsPeriod(req.query.period), filters);
+      if (purchasing.suppliers.length > limit) return failLargeExport();
+      return csvResponse(res, `purchases-by-supplier-${dated}.csv`,
+        ['Supplier code', 'Supplier', 'Purchase orders', 'Ordered value', 'Ordered quantity', 'Received value', 'Received quantity', 'Outstanding quantity', 'Fully received orders', 'Average days to first receipt'],
+        purchasing.suppliers.map((row) => [row.supplierCode, row.supplierName, row.purchaseOrderCount, row.orderedValue, row.orderedQuantity, row.receivedValue, row.receivedQuantity, row.outstandingQuantity, row.fullyReceivedOrderCount, row.averageDaysToFirstReceipt]));
+    }
+    if (req.params.dataset === 'purchasing-trend') {
+      const purchasing = analyticsPurchasing(db, range, analyticsPeriod(req.query.period), filters);
+      const receiving = new Map(purchasing.receivingTrend.map((row) => [row.period, row]));
+      const rows = purchasing.purchaseTrend.map((purchase) => {
+        const receipt = receiving.get(purchase.period);
+        return [
+          purchase.period,
+          purchase.orderCount,
+          purchase.orderedValue,
+          receipt?.receiptCount ?? 0,
+          receipt?.receivedQuantity ?? 0,
+          receipt?.receivedValue ?? 0,
+        ];
+      });
+      if (rows.length > limit) return failLargeExport();
+      return csvResponse(res, `purchasing-receiving-trend-${dated}.csv`,
+        ['Period', 'Purchase orders', 'Ordered value', 'Goods receipts', 'Received quantity', 'Received value'],
+        rows);
+    }
+    if (req.params.dataset === 'order-status') {
+      const sales = analyticsSalesTrend(db, range, analyticsPeriod(req.query.period), filters);
+      if (sales.statusBreakdown.length > limit) return failLargeExport();
+      return csvResponse(res, `order-status-${dated}.csv`,
+        ['Order status', 'Order count', 'Order value'],
+        sales.statusBreakdown.map((row) => [row.status, row.orderCount, row.orderValue]));
+    }
+    if (req.params.dataset === 'invoice-payment-status') {
+      const financials = analyticsFinancials(db, range);
+      const rows = [
+        ...financials.invoiceStatusDistribution.map((row) => ['Invoice', row.status, row.count, row.amount]),
+        ...financials.paymentStatusDistribution.map((row) => ['Payment', row.status, row.count, row.amount]),
+      ];
+      if (rows.length > limit) return failLargeExport();
+      return csvResponse(res, `invoice-payment-status-${dated}.csv`,
+        ['Record type', 'Status', 'Record count', 'Amount'],
+        rows);
+    }
+    if (req.params.dataset === 'returns-refunds') {
+      const summary = analyticsReturnsRefunds(db, range);
+      const rows = [
+        ...summary.returns.byStatus.map((row) => ['Return', row.status, row.count, row.acceptedCredit]),
+        ...summary.refunds.byStatus.map((row) => ['Refund', row.status, row.count, row.amount]),
+      ];
+      if (rows.length > limit) return failLargeExport();
+      return csvResponse(res, `returns-refunds-${dated}.csv`,
+        ['Record type', 'Status', 'Record count', 'Amount'],
+        rows);
+    }
+    if (req.params.dataset === 'stock-movements') {
+      const productFilters = productFilterSql(filters, 'p');
+      const rows = db.prepare(`
+        SELECT sm.created_at, sm.movement_type, sm.quantity_delta, sm.previous_quantity, sm.new_quantity,
+          sm.reference_type, sm.reference_id, sm.reason, p.sku, p.name AS product_name
+        FROM stock_movements sm JOIN products p ON p.id = sm.product_id
+        WHERE sm.created_at >= ? AND sm.created_at <= ? ${productFilters.sql}
+        ORDER BY sm.created_at DESC, sm.id DESC LIMIT ?
+      `).all(range.from, range.to, ...productFilters.params, limit + 1);
+      if (rows.length > limit) return failLargeExport();
+      return csvResponse(res, `stock-movements-${dated}.csv`,
+        ['Timestamp', 'Movement type', 'SKU', 'Product', 'Quantity change', 'Previous quantity', 'Resulting quantity', 'Reference type', 'Reference ID', 'Reason'],
+        rows.map((row) => [row.created_at, row.movement_type, row.sku, row.product_name, row.quantity_delta, row.previous_quantity, row.new_quantity, row.reference_type, row.reference_id, row.reason]));
+    }
+    return res.status(404).json({ error: 'Unknown analytics export dataset.' });
   });
 
   app.get('/api/products', (req, res) => {

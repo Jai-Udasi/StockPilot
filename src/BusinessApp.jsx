@@ -1,15 +1,15 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
-  Activity, ArrowLeftRight, Boxes, Check,
+  Activity, ArrowLeftRight, BarChart3, Boxes, Check,
   ChevronDown, CircleDollarSign, ClipboardList, FileText, LayoutDashboard,
-  LoaderCircle, Menu, Package, Plus, RefreshCw, Search, ShoppingCart,
+  LoaderCircle, Menu, Package, Plus, RefreshCw, RotateCcw, Search, ShoppingCart,
   Tag, Truck, Users, Wallet, X,
 } from 'lucide-react';
 import './business.css';
 
 const money = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' });
 const navGroups = [
-  { title: 'Overview', items: [['Dashboard', LayoutDashboard]] },
+  { title: 'Overview', items: [['Dashboard', LayoutDashboard], ['Reports', BarChart3]] },
   { title: 'Catalog', items: [['Products', Package], ['Categories', Tag], ['Suppliers', Truck], ['Customers', Users]] },
   { title: 'Operations', items: [['Sales orders', ShoppingCart], ['Purchase orders', ClipboardList], ['Goods receipts', Truck], ['Stock movements', ArrowLeftRight]] },
   { title: 'Finance', items: [['Invoices', FileText], ['Payments', Wallet], ['Returns & refunds', CircleDollarSign]] },
@@ -58,20 +58,83 @@ const isMoneyField = (key) => /(?:amount|total|balance|price|cost|payments|refun
 const statusClass = (value = '') => `badge badge-${String(value).toLowerCase().replaceAll('_', '-').replaceAll(' ', '-')}`;
 const shortId = (prefix, id) => `${prefix}-${String(id).padStart(5, '0')}`;
 
+function dateInputValue(date) {
+  return date.toISOString().slice(0, 10);
+}
+
+function presetDateRange(preset) {
+  const today = new Date();
+  const end = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate()));
+  const start = new Date(end);
+  if (preset === '7' || preset === '30' || preset === '90') {
+    start.setUTCDate(start.getUTCDate() - (Number(preset) - 1));
+  } else if (preset === 'month') {
+    start.setUTCDate(1);
+  } else if (preset === 'year') {
+    start.setUTCMonth(0, 1);
+  }
+  return { from: dateInputValue(start), to: dateInputValue(end) };
+}
+
+async function downloadAnalyticsCsv(dataset, range) {
+  const query = queryString({
+    from: range.from,
+    to: range.to,
+    period: range.period,
+    categoryId: range.categoryId,
+    supplierId: range.supplierId,
+    windowDays: range.windowDays,
+  });
+  let response;
+  try {
+    response = await fetch(`/api/analytics/exports/${dataset}.csv${query}`);
+  } catch {
+    throw new Error('Could not reach StockPilot. Check that the API server is running and try again.');
+  }
+  if (!response.ok) {
+    let message = `CSV export failed (${response.status}).`;
+    try {
+      message = (await response.json()).error || message;
+    } catch {
+      // Keep the explicit status message when the server response is not JSON.
+    }
+    throw new Error(message);
+  }
+  const url = URL.createObjectURL(await response.blob());
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = `${dataset}.csv`;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
 export default function BusinessApp() {
   const [page, setPage] = useState('Dashboard');
   const [mobileNav, setMobileNav] = useState(false);
+  const menuButtonRef = useRef(null);
   const [data, setData] = useState({});
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [toast, setToast] = useState('');
   const [search, setSearch] = useState('');
-  const [filters, setFilters] = useState({});
+  const [filters, setFilters] = useState(() => ({
+    Dashboard: { preset: '30', period: 'daily', ...presetDateRange('30') },
+    Reports: { preset: '30', period: 'daily', ...presetDateRange('30') },
+  }));
   const [pageIndex, setPageIndex] = useState({});
   const [dialog, setDialog] = useState(null);
   const [busy, setBusy] = useState(false);
+  const [exporting, setExporting] = useState('');
+  const exportInFlight = useRef(false);
+  const loadSequence = useRef(0);
 
   const loadPage = useCallback(async (target = page) => {
+    const requestSequence = ++loadSequence.current;
+    const setCurrentData = (updater) => {
+      if (requestSequence === loadSequence.current) setData(updater);
+    };
     setLoading(true);
     setError('');
     try {
@@ -79,8 +142,46 @@ export default function BusinessApp() {
       let result;
       switch (target) {
         case 'Dashboard':
-          result = await api('/dashboard');
-          setData((old) => ({ ...old, dashboard: result }));
+          {
+            const dimensions = { categoryId: filter.categoryId, supplierId: filter.supplierId };
+            const query = queryString({ from: filter.from, to: filter.to, period: filter.period || 'daily', ...dimensions, windowDays: filter.windowDays || 90 });
+            const [overview, inventory, salesTrend, topProducts, stockMovements, categories, suppliers] = await Promise.all([
+              api(`/analytics/overview${query}`),
+              api(`/analytics/inventory${queryString({ ...dimensions, windowDays: filter.windowDays || 90 })}`),
+              api(`/analytics/sales-trend${query}`),
+              api(`/analytics/top-products${queryString({ from: filter.from, to: filter.to, limit: 5, ...dimensions })}`),
+              api(`/analytics/stock-movements${queryString({ from: filter.from, to: filter.to, limit: 8, ...dimensions })}`),
+              api('/categories'),
+              api('/suppliers'),
+            ]);
+            setCurrentData((old) => ({
+              ...old,
+              analytics: { overview, inventory, salesTrend, topProducts, stockMovements, categories: categories.categories, suppliers: suppliers.suppliers },
+            }));
+          }
+          break;
+        case 'Reports':
+          {
+            const dimensions = { categoryId: filter.categoryId, supplierId: filter.supplierId };
+            const rangeQuery = queryString({ from: filter.from, to: filter.to, period: filter.period || 'daily', ...dimensions, windowDays: filter.windowDays || 90 });
+            const [sales, topProducts, purchasing, inventory, financials, returnsRefunds, statuses, movements, categories, suppliers] = await Promise.all([
+              api(`/analytics/sales-trend${rangeQuery}`),
+              api(`/analytics/top-products${queryString({ from: filter.from, to: filter.to, limit: 100, ...dimensions })}`),
+              api(`/analytics/purchasing${rangeQuery}`),
+              api(`/analytics/inventory${queryString({ ...dimensions, windowDays: filter.windowDays || 90 })}`),
+              api(`/analytics/financials${queryString({ from: filter.from, to: filter.to })}`),
+              api(`/analytics/returns-refunds${queryString({ from: filter.from, to: filter.to })}`),
+              api(`/analytics/status-distribution${rangeQuery}`),
+              api(`/analytics/stock-movements${queryString({ from: filter.from, to: filter.to, limit: 100, ...dimensions })}`),
+              api('/categories'),
+              api('/suppliers'),
+            ]);
+            setCurrentData((old) => ({
+              ...old,
+              reports: { sales, topProducts, purchasing, inventory, financials, returnsRefunds, statuses, movements },
+              reportOptions: { categories: categories.categories, suppliers: suppliers.suppliers },
+            }));
+          }
           break;
         case 'Products':
           {
@@ -88,20 +189,20 @@ export default function BusinessApp() {
               api(`/products${queryString({ q: search, categoryId: filter.categoryId, stock: filter.stock, active: filter.active, page: pageIndex[target] || 1, pageSize: 25 })}`),
               api('/categories'),
             ]);
-            setData((old) => ({ ...old, products: products.products, productMeta: products, categories: categories.categories }));
+            setCurrentData((old) => ({ ...old, products: products.products, productMeta: products, categories: categories.categories }));
           }
           break;
         case 'Categories':
           result = await api('/categories');
-          setData((old) => ({ ...old, categories: result.categories }));
+          setCurrentData((old) => ({ ...old, categories: result.categories }));
           break;
         case 'Suppliers':
           result = await api(`/suppliers${queryString({ q: search, active: filter.active })}`);
-          setData((old) => ({ ...old, suppliers: result.suppliers }));
+          setCurrentData((old) => ({ ...old, suppliers: result.suppliers }));
           break;
         case 'Customers':
           result = await api(`/customers${queryString({ q: search, active: filter.active })}`);
-          setData((old) => ({ ...old, customers: result.customers }));
+          setCurrentData((old) => ({ ...old, customers: result.customers }));
           break;
         case 'Sales orders':
           {
@@ -109,7 +210,7 @@ export default function BusinessApp() {
               api(`/orders${queryString({ status: filter.status, customerId: filter.customerId, from: asIso(filter.from), to: asIso(filter.to, true), page: pageIndex[target] || 1, pageSize: 25 })}`),
               api('/customers?active=true'),
             ]);
-            setData((old) => ({ ...old, orders: orders.orders, orderMeta: orders, customers: customers.customers }));
+            setCurrentData((old) => ({ ...old, orders: orders.orders, orderMeta: orders, customers: customers.customers }));
           }
           break;
         case 'Purchase orders':
@@ -118,7 +219,7 @@ export default function BusinessApp() {
               api(`/purchase-orders${queryString({ status: filter.status, supplierId: filter.supplierId, from: asIso(filter.from), to: asIso(filter.to, true), page: pageIndex[target] || 1, pageSize: 25 })}`),
               api('/suppliers?active=true'),
             ]);
-            setData((old) => ({ ...old, purchaseOrders: purchaseOrders.purchaseOrders, purchaseMeta: purchaseOrders, suppliers: suppliers.suppliers }));
+            setCurrentData((old) => ({ ...old, purchaseOrders: purchaseOrders.purchaseOrders, purchaseMeta: purchaseOrders, suppliers: suppliers.suppliers }));
           }
           break;
         case 'Goods receipts':
@@ -128,7 +229,7 @@ export default function BusinessApp() {
               api('/suppliers?active=true'),
               api('/purchase-orders?page=1&pageSize=100'),
             ]);
-            setData((old) => ({ ...old, receipts: receipts.receipts, receiptMeta: receipts, suppliers: suppliers.suppliers, purchaseOrders: purchaseOrders.purchaseOrders }));
+            setCurrentData((old) => ({ ...old, receipts: receipts.receipts, receiptMeta: receipts, suppliers: suppliers.suppliers, purchaseOrders: purchaseOrders.purchaseOrders }));
           }
           break;
         case 'Invoices':
@@ -138,7 +239,7 @@ export default function BusinessApp() {
               api('/customers?active=true'),
               api('/orders?page=1&pageSize=100'),
             ]);
-            setData((old) => ({ ...old, invoices: invoices.invoices, invoiceMeta: invoices, customers: customers.customers, orders: orders.orders }));
+            setCurrentData((old) => ({ ...old, invoices: invoices.invoices, invoiceMeta: invoices, customers: customers.customers, orders: orders.orders }));
           }
           break;
         case 'Payments':
@@ -147,7 +248,7 @@ export default function BusinessApp() {
               api(`/payments${queryString({ status: filter.status, invoiceId: filter.invoiceId, from: asIso(filter.from), to: asIso(filter.to, true), page: pageIndex[target] || 1, pageSize: 25 })}`),
               api('/invoices?page=1&pageSize=100'),
             ]);
-            setData((old) => ({ ...old, payments: payments.payments, paymentMeta: payments, invoices: invoices.invoices }));
+            setCurrentData((old) => ({ ...old, payments: payments.payments, paymentMeta: payments, invoices: invoices.invoices }));
           }
           break;
         case 'Returns & refunds': {
@@ -155,7 +256,7 @@ export default function BusinessApp() {
             api(`/returns${queryString({ status: filter.status, page: pageIndex[target] || 1, pageSize: 25 })}`),
             api(`/refunds${queryString({ status: filter.refundStatus, page: pageIndex[target] || 1, pageSize: 25 })}`),
           ]);
-          setData((old) => ({ ...old, returns: returnResult.returns, returnMeta: returnResult, refunds: refundResult.refunds, refundMeta: refundResult }));
+          setCurrentData((old) => ({ ...old, returns: returnResult.returns, returnMeta: returnResult, refunds: refundResult.refunds, refundMeta: refundResult }));
           break;
         }
         case 'Stock movements':
@@ -164,16 +265,16 @@ export default function BusinessApp() {
               api(`/stock-movements${queryString({ productId: filter.productId, type: filter.type, page: pageIndex[target] || 1, pageSize: 25 })}`),
               api('/products?page=1&pageSize=100'),
             ]);
-            setData((old) => ({ ...old, movements: movements.movements, movementMeta: movements, products: products.products }));
+            setCurrentData((old) => ({ ...old, movements: movements.movements, movementMeta: movements, products: products.products }));
           }
           break;
         default:
           break;
       }
     } catch (requestError) {
-      setError(requestError.message);
+      if (requestSequence === loadSequence.current) setError(requestError.message);
     } finally {
-      setLoading(false);
+      if (requestSequence === loadSequence.current) setLoading(false);
     }
   }, [filters, page, pageIndex, search]);
 
@@ -184,15 +285,56 @@ export default function BusinessApp() {
     return () => window.clearTimeout(timer);
   }, [toast]);
 
+  useEffect(() => {
+    if (!mobileNav) return undefined;
+    const closeOnEscape = (event) => {
+      if (event.key === 'Escape') {
+        setMobileNav(false);
+        menuButtonRef.current?.focus();
+      }
+    };
+    window.addEventListener('keydown', closeOnEscape);
+    return () => window.removeEventListener('keydown', closeOnEscape);
+  }, [mobileNav]);
+
+  const closeMobileNav = () => {
+    setMobileNav(false);
+    menuButtonRef.current?.focus();
+  };
   const navigate = (target) => {
     setPage(target);
-    setMobileNav(false);
+    if (mobileNav) closeMobileNav();
     setError('');
     setSearch('');
   };
   const setFilter = (key, value) => {
     setFilters((old) => ({ ...old, [page]: { ...(old[page] || {}), [key]: value } }));
     setPageIndex((old) => ({ ...old, [page]: 1 }));
+  };
+  const setAnalyticsFilter = (target, key, value) => {
+    setFilters((old) => {
+      const current = old[target] || {};
+      if (key === 'preset' && value !== 'custom') {
+        return { ...old, [target]: { ...current, ...presetDateRange(value), preset: value } };
+      }
+      return { ...old, [target]: { ...current, [key]: value, ...(key === 'from' || key === 'to' ? { preset: 'custom' } : {}) } };
+    });
+  };
+  const setDashboardFilter = (key, value) => setAnalyticsFilter('Dashboard', key, value);
+  const setReportFilter = (key, value) => setAnalyticsFilter('Reports', key, value);
+  const exportAnalyticsCsv = async (dataset, range = filters[page] || {}) => {
+    if (exportInFlight.current) return;
+    exportInFlight.current = true;
+    setExporting(dataset);
+    try {
+      await downloadAnalyticsCsv(dataset, range);
+      setToast(`${dataset.replaceAll('-', ' ')} CSV downloaded.`);
+    } catch (requestError) {
+      setError(requestError.message);
+    } finally {
+      exportInFlight.current = false;
+      setExporting('');
+    }
   };
   const updateSearch = (value) => {
     setSearch(value);
@@ -206,7 +348,7 @@ export default function BusinessApp() {
     try {
       await action();
       setDialog(null);
-      await Promise.all([...new Set(refreshTargets)].map((target) => loadPage(target)));
+      for (const target of new Set(refreshTargets)) await loadPage(target);
       setToast(success);
       return null;
     } catch (requestError) {
@@ -287,7 +429,7 @@ export default function BusinessApp() {
   };
 
   const dashboard = data.dashboard;
-  const pagesThatNeedData = ['Dashboard', 'Products', 'Categories', 'Suppliers', 'Customers', 'Sales orders', 'Purchase orders', 'Goods receipts', 'Invoices', 'Payments', 'Returns & refunds', 'Stock movements'];
+  const pagesThatNeedData = ['Dashboard', 'Reports', 'Products', 'Categories', 'Suppliers', 'Customers', 'Sales orders', 'Purchase orders', 'Goods receipts', 'Invoices', 'Payments', 'Returns & refunds', 'Stock movements'];
   const title = page;
 
   return (
@@ -298,7 +440,7 @@ export default function BusinessApp() {
           <small>BUSINESS</small>
         </a>
         <div className="biz-workspace"><span className="biz-workspace-icon">SP</span><span><strong>StockPilot</strong><small>Inventory workspace</small></span><ChevronDown size={15} /></div>
-        <nav className="biz-nav" aria-label="Main navigation">
+        <nav id="main-navigation" className="biz-nav" aria-label="Main navigation">
           {navGroups.map((group) => (
             <section key={group.title}>
               <h2>{group.title}</h2>
@@ -311,12 +453,18 @@ export default function BusinessApp() {
             </section>
           ))}
         </nav>
-        <div className="biz-sidebar-note"><span><Activity size={15} /></span><strong>Connected workspace</strong><p>Business activity is loaded from your local StockPilot database.</p></div>
+        <div className="biz-sidebar-note">
+          <span><Activity size={15} /></span>
+          <strong>{import.meta.env.DEV ? 'Development sample data' : 'Connected workspace'}</strong>
+          <p>{import.meta.env.DEV
+            ? 'This local database may include seeded sample records. Do not use it as production data.'
+            : 'Business activity is loaded from your local StockPilot database.'}</p>
+        </div>
       </aside>
-      {mobileNav && <button className="biz-scrim" aria-label="Close navigation" onClick={() => setMobileNav(false)} />}
+      {mobileNav && <button className="biz-scrim" aria-label="Close navigation" onClick={closeMobileNav} />}
       <main className="biz-main">
         <header className="biz-topbar">
-          <button className="biz-menu" aria-label="Open navigation" onClick={() => setMobileNav(true)}><Menu size={20} /></button>
+          <button ref={menuButtonRef} className="biz-menu" aria-label={mobileNav ? 'Close navigation' : 'Open navigation'} aria-expanded={mobileNav} aria-controls="main-navigation" onClick={() => mobileNav ? closeMobileNav() : setMobileNav(true)}><Menu size={20} /></button>
           <div><span className="biz-crumb">Workspace /</span><strong>{title}</strong></div>
           <div className="biz-top-actions">
             {page !== 'Dashboard' && <label className="biz-search"><Search size={16} /><input aria-label="Search current list" value={search} onChange={(event) => updateSearch(event.target.value)} placeholder={`Search ${title.toLowerCase()}…`} /></label>}
@@ -325,12 +473,13 @@ export default function BusinessApp() {
           </div>
         </header>
         <div className="biz-content">
-          {error && <div className="biz-error" role="alert"><X size={17} /><span>{error}</span><button aria-label="Dismiss error" onClick={() => setError('')}>Dismiss</button></div>}
+          {error && <div className="biz-error" role="alert"><X size={17} /><span>{error}</span><button aria-label="Retry loading this page" onClick={refresh}>Retry</button><button aria-label="Dismiss error" onClick={() => setError('')}>Dismiss</button></div>}
           {loading ? <Loading /> : pagesThatNeedData.includes(page) ? (
             <PageView
               page={page} data={data} search={search} filters={filters[page] || {}}
               onFilter={setFilter} onNavigate={navigate} onCreate={showCreate} onPageChange={(value) => changePage(page, value)}
               onDetails={openDetails} onConfirm={confirmAction}
+              onDashboardFilter={setDashboardFilter} onReportFilter={setReportFilter} onExport={exportAnalyticsCsv} exporting={exporting}
               onEdit={async (kind, record) => {
                 if (kind === 'purchaseOrder' || kind === 'salesOrder') {
                   try {
@@ -387,8 +536,9 @@ function Empty({ title = 'No records yet', detail = 'Records created in StockPil
   return <div className="biz-empty"><span><Package size={21} /></span><strong>{title}</strong><p>{detail}</p></div>;
 }
 
-function PageView({ page, data, search, filters, onFilter, onNavigate, onCreate, onDetails, onConfirm, onPageChange, onEdit }) {
-  if (page === 'Dashboard') return <Dashboard data={data.dashboard} navigate={onNavigate} onCreate={onCreate} />;
+function PageView({ page, data, search, filters, onFilter, onNavigate, onCreate, onDetails, onConfirm, onPageChange, onEdit, onDashboardFilter, onReportFilter, onExport, exporting }) {
+  if (page === 'Dashboard') return <Dashboard data={data.analytics} range={filters} navigate={onNavigate} onCreate={onCreate} onFilter={onDashboardFilter} onExport={onExport} exporting={exporting} />;
+  if (page === 'Reports') return <Reports data={data.reports} options={data.reportOptions || {}} range={filters} onFilter={onReportFilter} onExport={onExport} exporting={exporting} />;
   if (page === 'Products') return <Products data={data} search={search} filters={filters} onFilter={onFilter} onCreate={onCreate} onDetails={onDetails} onConfirm={onConfirm} onPageChange={onPageChange} />;
   if (page === 'Categories') return <Categories rows={data.categories || []} search={search} onCreate={onCreate} onDetails={onDetails} onEdit={onEdit} onConfirm={onConfirm} />;
   if (page === 'Suppliers') return <Suppliers rows={data.suppliers || []} search={search} filters={filters} onFilter={onFilter} onCreate={onCreate} onDetails={onDetails} onEdit={onEdit} onConfirm={onConfirm} />;
@@ -412,26 +562,256 @@ function PageHeader({ kicker, title, description, action, icon: _Icon = Plus }) 
   return <div className="biz-page-header"><div><span className="biz-kicker">{kicker}</span><h1>{title}</h1><p>{description}</p></div>{action && <button className="biz-button primary" onClick={action.onClick}><_Icon size={16} />{action.label}</button>}</div>;
 }
 
-function Dashboard({ data, navigate, onCreate }) {
+function Dashboard({ data, range, navigate, onCreate, onFilter, onExport, exporting }) {
   if (!data) return <Empty title="Dashboard unavailable" detail="Refresh the page to retry loading the dashboard." />;
+  const overview = data.overview;
+  const inventory = data.inventory;
+  const categories = data.categories || [];
+  const suppliers = data.suppliers || [];
+  const salesTrend = data.salesTrend.salesTrend;
+  const financials = overview.financials;
+  const movementByDay = new Map();
+  for (const movement of data.stockMovements.movementsByPeriodAndType) {
+    const day = movementByDay.get(movement.period) || { period: movement.period, inbound: 0, outbound: 0 };
+    day.inbound += movement.inbound_quantity;
+    day.outbound += movement.outbound_quantity;
+    movementByDay.set(movement.period, day);
+  }
+  const stockTrend = [...movementByDay.values()].slice(-14);
   const cards = [
-    ['Inventory value', asMoney(data.inventoryValue), 'On-hand retail value', CircleDollarSign],
-    ['Products', Number(data.productCount || 0).toLocaleString(), 'Catalog records', Package],
-    ['Units in stock', Number(data.unitsInStock || 0).toLocaleString(), 'Available inventory', Boxes],
-    ['Sales this month', asMoney(data.monthlyRevenue), `${data.monthlyOrderCount || 0} orders`, ShoppingCart],
+    ['Inventory cost value', asMoney(overview.inventory.inventoryValuation), `Retail value ${asMoney(overview.inventory.retailValue)}`, CircleDollarSign],
+    ['Units in stock', Number(overview.inventory.totalUnitsInStock).toLocaleString(), 'All non-archived products', Boxes],
+    ['Low-stock items', Number(overview.inventory.lowStockCount).toLocaleString(), 'Active products at reorder level', Package],
+    ['Out of stock', Number(overview.inventory.outOfStockCount).toLocaleString(), 'Active products at zero', Package],
+    ['Sales orders', Number(overview.sales.orderCount).toLocaleString(), 'Qualifying stock-deducted orders', ShoppingCart],
+    ['Average order value', asMoney(overview.sales.averageOrderValue), 'Gross sales / qualifying orders', CircleDollarSign],
+    ['Net sales', asMoney(overview.sales.netSalesValue), `${asMoney(overview.sales.acceptedReturnCredits)} accepted return credits`, ShoppingCart],
+    ['Missing costs', Number(overview.inventory.missingCostCount).toLocaleString(), 'Products excluded from cost valuation', CircleDollarSign],
+    ['Ledger warnings', Number(overview.inventory.reconciliationWarningCount).toLocaleString(), 'Stock differs from latest movement', Activity],
+    ['Outstanding invoices', asMoney(financials.outstandingReceivables), 'Current open receivables', FileText],
+    ['Net cash retained', asMoney(financials.netCashRetained), 'Completed payments less completed refunds', CircleDollarSign],
+    ['Unsettled return credits', asMoney(financials.unsettledReturnCredits), 'Current accepted credits not yet refunded', RotateCcw],
   ];
+  const maxSales = Math.max(...salesTrend.map((point) => point.salesValue), 0);
+  const maxCategoryValue = Math.max(...inventory.byCategory.map((category) => category.inventoryValue), 0);
+  const maxTopSales = Math.max(...data.topProducts.products.map((product) => product.unitsSold), 0);
+  const purchaseTrend = overview.purchasing.purchaseTrend;
+  const maxPurchaseValue = Math.max(...purchaseTrend.map((point) => point.purchaseValue), 0);
+  const maxStockValue = Math.max(...stockTrend.map((point) => point.inbound), ...stockTrend.map((point) => point.outbound), 0);
   return <>
-    <PageHeader kicker="BUSINESS OVERVIEW" title="Dashboard" description="A live view of inventory and sales activity." action={{ label: 'Create sales order', onClick: () => onCreate('salesOrder') }} icon={Plus} />
+    <PageHeader kicker="BUSINESS INTELLIGENCE" title="Analytics dashboard" description="Inventory, sales, purchasing and cash-flow insights from persisted records." action={{ label: 'Create sales order', onClick: () => onCreate('salesOrder') }} icon={Plus} />
+    <section className="biz-panel analytics-controls" aria-label="Analytics date filters">
+      <div className="analytics-date-fields">
+        <label className="biz-field"><span>Date range</span><select aria-label="Date range preset" value={range.preset || '30'} onChange={(event) => onFilter('preset', event.target.value)}>
+          <option value="7">Last 7 days</option><option value="30">Last 30 days</option><option value="90">Last 90 days</option><option value="month">This month</option><option value="year">This year</option><option value="custom">Custom range</option>
+        </select></label>
+        <label className="biz-field"><span>From</span><input aria-label="Analytics start date" type="date" value={range.from || ''} onChange={(event) => onFilter('from', event.target.value)} /></label>
+        <label className="biz-field"><span>To</span><input aria-label="Analytics end date" type="date" value={range.to || ''} onChange={(event) => onFilter('to', event.target.value)} /></label>
+        <label className="biz-field"><span>Sales interval</span><select aria-label="Sales trend interval" value={range.period || 'daily'} onChange={(event) => onFilter('period', event.target.value)}>
+          <option value="daily">Daily</option><option value="weekly">Weekly</option><option value="monthly">Monthly</option>
+        </select></label>
+        <label className="biz-field"><span>Category</span><select aria-label="Analytics category filter" value={range.categoryId || ''} onChange={(event) => onFilter('categoryId', event.target.value)}>
+          <option value="">All categories</option>{categories.map((category) => <option key={category.id} value={category.id}>{category.name}</option>)}
+        </select></label>
+        <label className="biz-field"><span>Supplier</span><select aria-label="Analytics supplier filter" value={range.supplierId || ''} onChange={(event) => onFilter('supplierId', event.target.value)}>
+          <option value="">All suppliers</option>{suppliers.map((supplier) => <option key={supplier.id} value={supplier.id}>{supplier.businessName}</option>)}
+        </select></label>
+        <label className="biz-field"><span>Movement window</span><select aria-label="Slow-moving stock window" value={range.windowDays || 90} onChange={(event) => onFilter('windowDays', event.target.value)}>
+          {[30, 60, 90, 180, 365].map((days) => <option key={days} value={days}>{days} days</option>)}
+        </select></label>
+      </div>
+      <div className="analytics-exports" aria-label="Download analytics CSV files">
+        <strong>Export CSV</strong>
+        {['inventory', 'low-stock', 'out-of-stock', 'top-products', 'sales-trend', 'sales-by-category', 'sales-summary', 'supplier-purchases', 'purchases-by-supplier', 'purchasing-trend', 'order-status', 'invoice-payment-status', 'returns-refunds', 'stock-movements'].map((dataset) => <ExportButton key={dataset} dataset={dataset} range={range} onExport={onExport} exporting={exporting}>{dataset.replaceAll('-', ' ')}</ExportButton>)}
+      </div>
+    </section>
     <div className="biz-stats">{cards.map(([label, value, note, _Icon]) => <article className="biz-stat" key={label}><span><_Icon size={18} /></span><small>{label}</small><strong>{value}</strong><em>{note}</em></article>)}</div>
     <div className="biz-dashboard-grid">
-      <section className="biz-panel"><div className="biz-panel-heading"><div><h2>Low-stock watch</h2><p>{data.lowStockCount || 0} products need attention</p></div><button className="biz-text-button" onClick={() => navigate('Products')}>View inventory →</button></div>
-        {data.lowStockProducts?.length ? <div className="biz-row-list">{data.lowStockProducts.map((product) => <div className="biz-row" key={product.id}><span className="biz-avatar"><Package size={16} /></span><div><strong>{product.name}</strong><small>{product.sku} · {product.category}</small></div><b>{product.quantity} left</b></div>)}</div> : <Empty title="Stock levels look good" detail="Low-stock items will be shown here." />}
+      <section className="biz-panel analytics-panel"><div className="biz-panel-heading"><div><h2>Gross sales trend</h2><p>Qualifying order totals by {data.salesTrend.period} · return credits shown separately</p></div><ExportButton dataset="sales-trend" range={range} onExport={onExport} exporting={exporting} /></div>
+        {salesTrend.some((point) => point.orderCount) ? <div className="analytics-chart-scroll"><div className="analytics-sales-chart" role="img" aria-label="Sales value trend chart">
+          {salesTrend.map((point) => <div className="analytics-bar-column" key={point.period} title={`${point.period}: ${asMoney(point.salesValue)} · ${point.orderCount} orders`}><div className="analytics-bar-track"><span className="analytics-bar sales" style={{ height: `${maxSales ? Math.max(3, point.salesValue / maxSales * 100) : 0}%` }} /></div><small>{point.period.slice(5)}</small></div>)}
+        </div></div> : <Empty title="No sales in this range" detail="Confirmed and fulfilled orders will appear here." />}
       </section>
-      <section className="biz-panel"><div className="biz-panel-heading"><div><h2>Recent orders</h2><p>Latest persisted sales</p></div><button className="biz-text-button" onClick={() => navigate('Sales orders')}>View orders →</button></div>
-        {data.recentOrders?.length ? <div className="biz-row-list">{data.recentOrders.map((order) => <div className="biz-row" key={order.id}><span className="biz-avatar"><ShoppingCart size={16} /></span><div><strong>{order.orderNumber}</strong><small>{order.customerName} · {textDate(order.createdAt)}</small></div><b>{asMoney(order.total)}</b></div>)}</div> : <Empty title="No sales orders yet" detail="Sales orders will appear here when saved." />}
+      <section className="biz-panel analytics-panel"><div className="biz-panel-heading"><div><h2>Inventory by category</h2><p>Current cost and retail value · missing cost is not inferred</p></div><ExportButton dataset="inventory" range={range} onExport={onExport} exporting={exporting} /></div>
+        {inventory.byCategory.length ? <div className="analytics-ranked-list">{inventory.byCategory.map((category) => <div className="analytics-ranked" key={`${category.categoryId}-${category.category}`}><div><strong>{category.category}</strong><span>{category.unitsInStock.toLocaleString()} units · {category.productCount} products · cost {asMoney(category.inventoryValue)} · retail {asMoney(category.retailValue)}</span></div><div className="analytics-rank-track"><span style={{ width: `${maxCategoryValue ? category.inventoryValue / maxCategoryValue * 100 : 0}%` }} /></div></div>)}</div> : <Empty title="No inventory records" />}
+      </section>
+      <section className="biz-panel analytics-panel"><div className="biz-panel-heading"><div><h2>Sales by category</h2><p>Current product category · accepted return credits shown separately</p></div><ExportButton dataset="sales-by-category" range={range} onExport={onExport} exporting={exporting} /></div>
+        {overview.sales.byCategory.length ? <div className="biz-table-wrap"><table className="biz-table analytics-table"><thead><tr><th>Category</th><th>Units net</th><th>Gross sales</th><th>Return credits</th><th>Net sales</th></tr></thead><tbody>{overview.sales.byCategory.map((row) => <tr key={`${row.categoryId}-${row.category}`}><td><strong>{row.category}</strong></td><td>{row.netUnitsSold.toLocaleString()}</td><td>{asMoney(row.grossSalesValue)}</td><td>{asMoney(row.acceptedReturnCredits)}</td><td>{asMoney(row.netSalesValue)}</td></tr>)}</tbody></table></div> : <Empty title="No category sales in this range" /> }
+        <div className="analytics-status-list">{overview.sales.statusBreakdown.map((row) => <span key={row.status}><Badge value={row.status} /> {row.orderCount} · {asMoney(row.orderValue)}</span>)}</div>
+      </section>
+      <section className="biz-panel analytics-panel"><div className="biz-panel-heading"><div><h2>Top-selling products</h2><p>Historical order-line snapshots · units sold</p></div><ExportButton dataset="top-products" range={range} onExport={onExport} exporting={exporting} /></div>
+        {data.topProducts.products.length ? <div className="analytics-ranked-list">{data.topProducts.products.map((product) => <div className="analytics-ranked" key={product.productId}><div><strong>{product.productName} <small>{product.sku}</small></strong><span>{product.netUnitsSold.toLocaleString()} net units · {product.orderCount} orders · gross {asMoney(product.salesValue)} · net {asMoney(product.netSalesValue)}</span></div><div className="analytics-rank-track"><span style={{ width: `${maxTopSales ? product.unitsSold / maxTopSales * 100 : 0}%` }} /></div></div>)}</div> : <Empty title="No qualifying sales" detail="Products will rank here after confirmed orders." />}
+      </section>
+      <section className="biz-panel analytics-panel"><div className="biz-panel-heading"><div><h2>Recent sales</h2><p>Most recent qualifying orders in the selected range</p></div><button className="biz-text-button" onClick={() => navigate('Sales orders')}>View sales orders →</button></div>
+        {overview.sales.recentSales.length ? <div className="biz-table-wrap"><table className="biz-table analytics-table"><thead><tr><th>Order</th><th>Customer</th><th>Date</th><th>Status</th><th>Total</th></tr></thead><tbody>{overview.sales.recentSales.map((order) => <tr key={order.id}><td><strong>{order.orderNumber}</strong></td><td>{order.customerName || 'Walk-in'}</td><td>{textDate(order.createdAt)}</td><td><Badge value={order.status} /></td><td>{asMoney(order.total)}</td></tr>)}</tbody></table></div> : <Empty title="No recent qualifying sales" detail="Sales appear after stock is deducted for an eligible order." />}
+      </section>
+      <section className="biz-panel analytics-panel"><div className="biz-panel-heading"><div><h2>Purchasing trend</h2><p>Ordered {asMoney(overview.purchasing.orderedValue)} · received {asMoney(overview.purchasing.receivedValue)} ({overview.purchasing.receivedQuantity} units) · order creation vs receipt date</p></div><button className="biz-text-button" onClick={() => navigate('Purchase orders')}>View purchases →</button></div>
+        {purchaseTrend.some((point) => point.orderCount) ? <div className="analytics-chart-scroll"><div className="analytics-sales-chart" role="img" aria-label="Purchase order value trend chart">
+          {purchaseTrend.map((point) => <div className="analytics-bar-column" key={point.period} title={`${point.period}: ${asMoney(point.purchaseValue)} · ${point.orderCount} purchase orders`}><div className="analytics-bar-track"><span className="analytics-bar purchase" style={{ height: `${maxPurchaseValue ? Math.max(3, point.purchaseValue / maxPurchaseValue * 100) : 0}%` }} /></div><small>{point.period.slice(5)}</small></div>)}
+        </div></div> : <Empty title="No submitted purchases in this range" detail="Submitted and received purchase orders will appear here." />}
+      </section>
+      <section className="biz-panel analytics-panel"><div className="biz-panel-heading"><div><h2>Stock movement trend</h2><p>Ledger quantities · selected period</p></div><ExportButton dataset="stock-movements" range={range} onExport={onExport} exporting={exporting} /></div>
+        {stockTrend.length ? <div className="analytics-chart-scroll"><div className="analytics-sales-chart" role="img" aria-label="Stock movement inbound and outbound quantity chart">
+          {stockTrend.map((point) => <div className="analytics-bar-column" key={point.period} title={`${point.period}: ${point.inbound} inbound · ${point.outbound} outbound`}><div className="analytics-bar-track analytics-double"><span className="analytics-bar inbound" style={{ height: `${maxStockValue ? Math.max(point.inbound ? 3 : 0, point.inbound / maxStockValue * 100) : 0}%` }} /><span className="analytics-bar outbound" style={{ height: `${maxStockValue ? Math.max(point.outbound ? 3 : 0, point.outbound / maxStockValue * 100) : 0}%` }} /></div><small>{point.period.slice(5)}</small></div>)}
+        </div><div className="analytics-legend"><span><i className="inbound" /> Inbound</span><span><i className="outbound" /> Outbound</span></div></div> : <Empty title="No stock movements in this range" />}
+      </section>
+    </div>
+    <div className="biz-dashboard-grid analytics-bottom-grid">
+      <section className="biz-panel analytics-panel"><div className="biz-panel-heading"><div><h2>Restock watch</h2><p>{overview.inventory.lowStockCount} active products at or below reorder threshold</p></div><button className="biz-text-button" onClick={() => navigate('Products')}>View inventory →</button></div>
+        {inventory.lowStockProducts.length ? <div className="biz-table-wrap"><table className="biz-table analytics-table"><thead><tr><th>Product</th><th>On hand</th><th>Reorder at</th><th>Stock value</th></tr></thead><tbody>{inventory.lowStockProducts.slice(0, 8).map((product) => <tr key={product.id}><td><strong>{product.name}</strong><small className="analytics-table-sub">{product.sku} · {product.category}</small></td><td>{product.quantity}</td><td>{product.reorderThreshold}</td><td>{asMoney(product.stockValue)}</td></tr>)}</tbody></table></div> : <Empty title="Stock levels look good" detail="No active products are at their reorder threshold." />}
+      </section>
+      <section className="biz-panel analytics-panel"><div className="biz-panel-heading"><div><h2>Financial summary</h2><p>Period flows and current outstanding balance</p></div><button className="biz-text-button" onClick={() => navigate('Invoices')}>View invoices →</button></div>
+        <div className="analytics-financial-list">
+          {[['Invoices issued', financials.invoicesIssued, 'Period by invoice date'], ['Payments received', financials.paymentsReceived, 'Completed payments by payment date'], ['Accepted return credits', financials.acceptedReturnCredits, 'Period by return date'], ['Refunds completed', financials.completedRefunds, 'Period by completion date'], ['Net cash retained', financials.netCashRetained, 'Payments less refunds in the selected period'], ['Unsettled return credits', financials.unsettledReturnCredits, 'Current accepted credits less completed refunds'], ['Outstanding receivables', financials.outstandingReceivables, 'Current: invoice total less completed payments and accepted credits']].map(([label, value, note]) => <div className="analytics-financial-row" key={label}><span><strong>{label}</strong><small>{note}</small></span><b>{asMoney(value)}</b></div>)}
+        </div>
+      </section>
+      <section className="biz-panel analytics-panel"><div className="biz-panel-heading"><div><h2>Supplier delivery performance</h2><p>Order date for ordered value · receipt date for deliveries</p></div><ExportButton dataset="supplier-purchases" range={range} onExport={onExport} exporting={exporting} /></div>
+        {overview.purchasing.suppliers.length ? <div className="biz-table-wrap"><table className="biz-table analytics-table"><thead><tr><th>Supplier</th><th>Ordered</th><th>Received</th><th>Outstanding units</th><th>Avg. first receipt</th></tr></thead><tbody>{overview.purchasing.suppliers.map((supplier) => <tr key={supplier.supplierId}><td><strong>{supplier.supplierName}</strong><small className="analytics-table-sub">{supplier.supplierCode} · {supplier.purchaseOrderCount} orders</small></td><td>{asMoney(supplier.orderedValue)}</td><td>{asMoney(supplier.receivedValue)} · {supplier.receivedQuantity} units</td><td>{supplier.outstandingQuantity}</td><td>{supplier.averageDaysToFirstReceipt === null ? '—' : `${supplier.averageDaysToFirstReceipt} days`}</td></tr>)}</tbody></table></div> : <Empty title="No submitted purchases in this range" /> }
+      </section>
+      <section className="biz-panel analytics-panel"><div className="biz-panel-heading"><div><h2>Stock movement insights</h2><p>{inventory.slowMovement.windowDays}-day lookback · active products with stock on hand</p></div><button className="biz-text-button" onClick={() => navigate('Stock movements')}>View ledger →</button></div>
+        <div className="analytics-financial-list">
+          <div className="analytics-financial-row"><span><strong>Non-moving</strong><small>No qualifying sales history</small></span><b>{inventory.slowMovement.nonMovingCount}</b></div>
+          <div className="analytics-financial-row"><span><strong>Slow-moving</strong><small>Last qualifying sale predates the lookback window</small></span><b>{inventory.slowMovement.slowMovingCount}</b></div>
+          <div className="analytics-financial-row"><span><strong>Stock reconciliation warnings</strong><small>Latest ledger balance differs from product stock</small></span><b>{inventory.reconciliationWarnings.length}</b></div>
+        </div>
+        {[...inventory.slowMovement.nonMovingProducts, ...inventory.slowMovement.slowMovingProducts].slice(0, 6).map((product) => <div className="biz-row" key={product.id}><span className="biz-avatar"><Package size={16} /></span><div><strong>{product.name} · {product.quantity} on hand</strong><small>{product.sku} · last sold {product.lastSoldAt ? textDate(product.lastSoldAt) : 'never'}</small></div><b>{asMoney(product.stockValue)}</b></div>)}
+        {inventory.reconciliationWarnings.slice(0, 4).map((warning) => <div className="biz-row" key={`warning-${warning.id}`}><span className="biz-avatar"><Activity size={16} /></span><div><strong>{warning.name} · stock mismatch</strong><small>{warning.sku} · product {warning.currentQuantity} / ledger {warning.ledgerQuantity}</small></div></div>)}
+      </section>
+      <section className="biz-panel analytics-panel"><div className="biz-panel-heading"><div><h2>Recent stock activity</h2><p>Latest ledger entries in the selected range</p></div><button className="biz-text-button" onClick={() => navigate('Stock movements')}>View ledger →</button></div>
+        {data.stockMovements.recentMovements.length ? <div className="biz-row-list">{data.stockMovements.recentMovements.map((movement) => <div className="biz-row" key={movement.id}><span className="biz-avatar"><Activity size={16} /></span><div><strong>{movement.productName} · {movement.movementType.replaceAll('_', ' ')}</strong><small>{movement.sku} · {textDate(movement.createdAt)} · {movement.referenceType || 'no reference'}</small></div><b className={movement.quantityDelta < 0 ? 'biz-negative' : 'biz-positive'}>{movement.quantityDelta > 0 ? '+' : ''}{movement.quantityDelta}</b></div>)}</div> : <Empty title="No recent stock activity" />}
       </section>
     </div>
     <div className="biz-quick-links">{[['Products', Package], ['Purchase orders', Truck], ['Invoices', FileText], ['Stock movements', ArrowLeftRight]].map(([name, _Icon]) => <button key={name} onClick={() => navigate(name)}><_Icon size={17} /><span>{name}</span><b>→</b></button>)}</div>
+  </>;
+}
+
+function Reports({ data, options, range, onFilter, onExport, exporting }) {
+  if (!data) return <Empty title="Reports unavailable" detail="Retry loading to fetch saved analytics reports." />;
+  const { sales, topProducts, purchasing, inventory, financials, returnsRefunds, statuses, movements } = data;
+  const categories = options.categories || [];
+  const suppliers = options.suppliers || [];
+  const exportDatasets = [
+    'sales-summary', 'sales-trend', 'sales-by-category', 'top-products',
+    'purchases-by-supplier', 'purchasing-trend', 'inventory', 'low-stock',
+    'out-of-stock', 'order-status', 'invoice-payment-status', 'returns-refunds',
+    'stock-movements',
+  ];
+  return <>
+    <PageHeader kicker="BUSINESS INTELLIGENCE" title="Reports" description="Explore persisted sales, purchasing, inventory, financial and stock-ledger data." />
+    <section className="biz-panel analytics-controls" aria-label="Report filters">
+      <div className="analytics-date-fields">
+        <label className="biz-field"><span>Date range</span><select aria-label="Report date range preset" value={range.preset || '30'} onChange={(event) => onFilter('preset', event.target.value)}>
+          <option value="7">Last 7 days</option><option value="30">Last 30 days</option><option value="90">Last 90 days</option><option value="month">This month</option><option value="year">This year</option><option value="custom">Custom range</option>
+        </select></label>
+        <label className="biz-field"><span>From</span><input aria-label="Report start date" type="date" value={range.from || ''} onChange={(event) => onFilter('from', event.target.value)} /></label>
+        <label className="biz-field"><span>To</span><input aria-label="Report end date" type="date" value={range.to || ''} onChange={(event) => onFilter('to', event.target.value)} /></label>
+        <label className="biz-field"><span>Interval</span><select aria-label="Report interval" value={range.period || 'daily'} onChange={(event) => onFilter('period', event.target.value)}>
+          <option value="daily">Daily</option><option value="weekly">Weekly</option><option value="monthly">Monthly</option>
+        </select></label>
+        <label className="biz-field"><span>Category</span><select aria-label="Report category filter" value={range.categoryId || ''} onChange={(event) => onFilter('categoryId', event.target.value)}>
+          <option value="">All categories</option>{categories.map((category) => <option key={category.id} value={category.id}>{category.name}</option>)}
+        </select></label>
+        <label className="biz-field"><span>Supplier</span><select aria-label="Report supplier filter" value={range.supplierId || ''} onChange={(event) => onFilter('supplierId', event.target.value)}>
+          <option value="">All suppliers</option>{suppliers.map((supplier) => <option key={supplier.id} value={supplier.id}>{supplier.businessName}</option>)}
+        </select></label>
+      </div>
+      <div className="analytics-exports" aria-label="Report CSV downloads">
+        <strong>Download reports</strong>
+        {exportDatasets.map((dataset) => <ExportButton key={dataset} dataset={dataset} range={range} onExport={onExport} exporting={exporting}>{dataset.replaceAll('-', ' ')}</ExportButton>)}
+      </div>
+    </section>
+    <div className="biz-stats report-stats">
+      {[
+        ['Gross sales', asMoney(sales.grossSalesValue)],
+        ['Orders', Number(sales.salesTrend.reduce((total, item) => total + item.orderCount, 0)).toLocaleString()],
+        ['Purchases ordered', asMoney(purchasing.orderedValue)],
+        ['Goods received', asMoney(purchasing.receivedValue)],
+      ].map(([label, value]) => <article className="biz-stat" key={label}><small>{label}</small><strong>{value}</strong></article>)}
+    </div>
+    <div className="biz-dashboard-grid">
+      <section className="biz-panel analytics-panel"><div className="biz-panel-heading"><div><h2>Sales by period</h2><p>{sales.dateBasis} · accepted credits are separate</p></div></div>
+        <div className="biz-table-wrap"><RecordTable rows={sales.salesTrend.map((row) => ({ key: row.period, record: row }))} emptyTitle="No sales in this range" columns={[
+          { label: 'Period', render: (_, row) => textDate(row.period) },
+          { label: 'Orders', render: (_, row) => row.orderCount.toLocaleString() },
+          { label: 'Gross sales', render: (_, row) => asMoney(row.salesValue) },
+          { label: 'Return credits', render: (_, row) => asMoney(row.acceptedReturnCredits) },
+          { label: 'Net sales', render: (_, row) => asMoney(row.netSalesValue) },
+        ]} /></div>
+      </section>
+      <section className="biz-panel analytics-panel"><div className="biz-panel-heading"><div><h2>Sales by product</h2><p>Persisted order-line snapshots · top 100 results</p></div></div>
+        <div className="biz-table-wrap"><RecordTable rows={topProducts.products.map((row) => ({ key: row.productId, record: row }))} emptyTitle="No qualifying product sales" columns={[
+          { label: 'Product', render: (_, row) => <div className="biz-cell-main"><strong>{row.productName}</strong><small>{row.sku}</small></div> },
+          { label: 'Units', render: (_, row) => row.unitsSold.toLocaleString() },
+          { label: 'Gross sales', render: (_, row) => asMoney(row.salesValue) },
+          { label: 'Net sales', render: (_, row) => asMoney(row.netSalesValue) },
+        ]} /></div>
+      </section>
+      <section className="biz-panel analytics-panel"><div className="biz-panel-heading"><div><h2>Sales by category</h2><p>Current product category assignment</p></div></div>
+        <div className="biz-table-wrap"><RecordTable rows={sales.byCategory.map((row) => ({ key: `${row.categoryId}-${row.category}`, record: row }))} emptyTitle="No category sales in this range" columns={[
+          { label: 'Category', key: 'category' }, { label: 'Units sold', render: (_, row) => row.unitsSold.toLocaleString() },
+          { label: 'Gross sales', render: (_, row) => asMoney(row.grossSalesValue) }, { label: 'Return credits', render: (_, row) => asMoney(row.acceptedReturnCredits) },
+          { label: 'Net sales', render: (_, row) => asMoney(row.netSalesValue) },
+        ]} /></div>
+      </section>
+      <section className="biz-panel analytics-panel"><div className="biz-panel-heading"><div><h2>Purchases by supplier</h2><p>Ordered totals and actual receipt totals</p></div></div>
+        <div className="biz-table-wrap"><RecordTable rows={purchasing.suppliers.map((row) => ({ key: row.supplierId, record: row }))} emptyTitle="No submitted purchase orders in this range" columns={[
+          { label: 'Supplier', render: (_, row) => <div className="biz-cell-main"><strong>{row.supplierName}</strong><small>{row.supplierCode}</small></div> },
+          { label: 'Orders', key: 'purchaseOrderCount' }, { label: 'Ordered', render: (_, row) => asMoney(row.orderedValue) },
+          { label: 'Received', render: (_, row) => asMoney(row.receivedValue) }, { label: 'Outstanding units', key: 'outstandingQuantity' },
+        ]} /></div>
+      </section>
+      <section className="biz-panel analytics-panel"><div className="biz-panel-heading"><div><h2>Inventory valuation</h2><p>Current cost basis; retail value shown separately</p></div></div>
+        <div className="biz-table-wrap"><RecordTable rows={inventory.byCategory.map((row) => ({ key: `${row.categoryId}-${row.category}`, record: row }))} emptyTitle="No inventory records" columns={[
+          { label: 'Category', key: 'category' }, { label: 'Products', key: 'productCount' }, { label: 'Units', render: (_, row) => row.unitsInStock.toLocaleString() },
+          { label: 'Cost value', render: (_, row) => asMoney(row.inventoryValue) }, { label: 'Retail value', render: (_, row) => asMoney(row.retailValue) },
+        ]} /></div>
+        <p className="biz-hint">Total cost valuation: {asMoney(inventory.inventoryValuation)} · missing unit costs: {inventory.missingCostCount}</p>
+      </section>
+      <section className="biz-panel analytics-panel"><div className="biz-panel-heading"><div><h2>Low-stock and out-of-stock</h2><p>Current active products at configured reorder thresholds</p></div></div>
+        <div className="biz-table-wrap"><RecordTable rows={[...inventory.lowStockProducts, ...inventory.outOfStockProducts.filter((row) => !inventory.lowStockProducts.some((low) => low.id === row.id))].map((row) => ({ key: row.id, record: row }))} emptyTitle="No stock alerts" columns={[
+          { label: 'Product', render: (_, row) => <div className="biz-cell-main"><strong>{row.name}</strong><small>{row.sku} · {row.category}</small></div> },
+          { label: 'On hand', key: 'quantity' }, { label: 'Reorder at', key: 'reorderThreshold' },
+          { label: 'Cost value', render: (_, row) => asMoney(row.stockValue) },
+        ]} /></div>
+      </section>
+      <section className="biz-panel analytics-panel"><div className="biz-panel-heading"><div><h2>Order and invoice/payment status</h2><p>Persisted status counts for selected date range</p></div></div>
+        <div className="analytics-status-list">{[
+          ['Orders', statuses.orderStatusDistribution],
+          ['Invoices', statuses.invoiceStatusDistribution],
+          ['Payments', statuses.paymentStatusDistribution],
+        ].flatMap(([label, rows]) => rows.map((row) => <span key={`${label}-${row.status}`}><strong>{label}</strong> <Badge value={row.status} /> {row.count} · {asMoney(row.orderValue ?? row.amount)}</span>))}</div>
+      </section>
+      <section className="biz-panel analytics-panel"><div className="biz-panel-heading"><div><h2>Returns and refunds</h2><p>Return credits and refunds remain separate financial measures</p></div></div>
+        <div className="analytics-financial-list">
+          <div className="analytics-financial-row"><span><strong>Accepted return credits</strong><small>By return date</small></span><b>{asMoney(returnsRefunds.returns.acceptedReturnCredits)}</b></div>
+          <div className="analytics-financial-row"><span><strong>Completed refunds</strong><small>Refund status summary by creation date</small></span><b>{asMoney(returnsRefunds.refunds.completedAmount)}</b></div>
+          <div className="analytics-status-list">{[
+            ...returnsRefunds.returns.byStatus.map((row) => ['Return', row]),
+            ...returnsRefunds.refunds.byStatus.map((row) => ['Refund', row]),
+          ].map(([label, row]) => <span key={`${label}-${row.status}`}><strong>{label}</strong> <Badge value={row.status} /> {row.count}</span>)}</div>
+        </div>
+      </section>
+      <section className="biz-panel analytics-panel"><div className="biz-panel-heading"><div><h2>Stock movements</h2><p>Latest 100 ledger entries in the selected range</p></div></div>
+        <div className="biz-table-wrap"><RecordTable rows={movements.recentMovements.map((row) => ({ key: row.id, record: row }))} emptyTitle="No stock movements in this range" columns={[
+          { label: 'Date', render: (_, row) => textDate(row.createdAt) },
+          { label: 'Product', render: (_, row) => <div className="biz-cell-main"><strong>{row.productName}</strong><small>{row.sku}</small></div> },
+          { label: 'Type', render: (_, row) => <Badge value={row.movementType} /> }, { label: 'Change', key: 'quantityDelta' },
+          { label: 'Resulting stock', key: 'newQuantity' }, { label: 'Reference', key: 'referenceType' },
+        ]} /></div>
+      </section>
+    </div>
+    <section className="biz-panel report-financial-summary"><div className="biz-panel-heading"><div><h2>Financial status and balances</h2><p>Date-filtered flows plus separately labeled current-state balances</p></div></div>
+      <div className="analytics-financial-list">
+        {[
+          ['Invoices issued', financials.invoicesIssued],
+          ['Completed payments', financials.paymentsReceived],
+          ['Accepted return credits', financials.acceptedReturnCredits],
+          ['Completed refunds', financials.completedRefunds],
+          ['Net cash retained', financials.netCashRetained],
+          ['Outstanding receivables (current)', financials.outstandingReceivables],
+        ].map(([label, value]) => <div className="analytics-financial-row" key={label}><span><strong>{label}</strong></span><b>{asMoney(value)}</b></div>)}
+      </div>
+    </section>
   </>;
 }
 
@@ -440,6 +820,13 @@ function Table({ columns, rows, emptyTitle }) {
   return <div className="biz-table-wrap"><table className="biz-table"><thead><tr>{columns.map((column) => <th key={column.label}>{column.label}</th>)}</tr></thead><tbody>
     {rows.map((row) => <tr key={row.key}>{columns.map((column) => <td key={column.label}>{column.render ? column.render(row.value, row.record) : row.record[column.key]}</td>)}</tr>)}
   </tbody></table></div>;
+}
+
+function ExportButton({ dataset, range, onExport, exporting, children = 'Download CSV' }) {
+  const current = exporting === dataset;
+  return <button type="button" className={children === 'Download CSV' ? 'biz-text-button' : 'biz-action'} disabled={Boolean(exporting)} aria-busy={current} onClick={() => onExport(dataset, range)}>
+    {current ? 'Preparing CSV…' : children}
+  </button>;
 }
 
 function RecordTable({ columns, rows, emptyTitle }) {
@@ -655,13 +1042,15 @@ function Movements({ rows, meta, products, filters, onFilter, onDetails, onPageC
 
 function Dialog({ title, onClose, children, wide = false }) {
   const dialogRef = useRef(null);
+  const onCloseRef = useRef(onClose);
+  useEffect(() => { onCloseRef.current = onClose; }, [onClose]);
   useEffect(() => {
     const previousFocus = document.activeElement;
     const dialog = dialogRef.current;
     const focusable = () => [...dialog.querySelectorAll('button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex]:not([tabindex="-1"])')];
     (focusable()[0] || dialog).focus();
     const keyHandler = (event) => {
-      if (event.key === 'Escape') onClose();
+      if (event.key === 'Escape') onCloseRef.current();
       if (event.key === 'Tab') {
         const items = focusable();
         if (!items.length) {
@@ -681,7 +1070,7 @@ function Dialog({ title, onClose, children, wide = false }) {
       window.removeEventListener('keydown', keyHandler);
       previousFocus?.focus?.();
     };
-  }, [onClose]);
+  }, []);
   return <div className="biz-dialog-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
     <section ref={dialogRef} tabIndex="-1" className={`biz-dialog ${wide ? 'wide' : ''}`} role="dialog" aria-modal="true" aria-labelledby="biz-dialog-title">
       <header><div><span className="biz-kicker">STOCKPILOT RECORD</span><h2 id="biz-dialog-title">{title}</h2></div><button className="biz-icon-button" aria-label="Close dialog" onClick={onClose}><X size={18} /></button></header>

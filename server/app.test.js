@@ -427,6 +427,28 @@ describe('StockPilot REST API', () => {
     assert.equal(invalidOrder.status, 400);
     assert.equal((await client.get('/api/health')).body.status, 'ok');
   });
+
+  it('limits cross-origin API access, applies security headers, and rejects oversized JSON', async () => {
+    const restrictedClient = request(createApp({ db, corsOrigins: 'https://stockpilot.example' }));
+    const trusted = await restrictedClient.get('/api/health').set('Origin', 'https://stockpilot.example');
+    assert.equal(trusted.status, 200);
+    assert.equal(trusted.headers['access-control-allow-origin'], 'https://stockpilot.example');
+    assert.equal(trusted.headers['x-content-type-options'], 'nosniff');
+    assert.equal(trusted.headers['x-frame-options'], 'DENY');
+    assert.equal(trusted.headers['referrer-policy'], 'no-referrer');
+    assert.equal(trusted.headers['permissions-policy'], 'camera=(), microphone=(), geolocation=()');
+    assert.equal(trusted.headers['x-powered-by'], undefined);
+
+    const untrusted = await restrictedClient.get('/api/health').set('Origin', 'https://untrusted.example');
+    assert.equal(untrusted.status, 200);
+    assert.equal(untrusted.headers['access-control-allow-origin'], undefined);
+
+    const oversized = await restrictedClient.post('/api/categories')
+      .set('Content-Type', 'application/json')
+      .send(JSON.stringify({ name: 'x'.repeat(110_000) }));
+    assert.equal(oversized.status, 413);
+    assert.match(oversized.body.error, /too large/i);
+  });
 });
 
 describe('Core business data APIs', () => {
@@ -1219,6 +1241,33 @@ describe('Invoices, payments, returns, and refunds', () => {
 });
 
 describe('Database foundation', () => {
+  it('requires production databases to be explicitly provisioned and avoids production seeding', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'stockpilot-production-db-'));
+    const dbPath = path.join(dir, 'production.db');
+    const previousNodeEnv = process.env.NODE_ENV;
+    const previousDatabasePath = process.env.DATABASE_PATH;
+
+    process.env.NODE_ENV = 'production';
+    try {
+      delete process.env.DATABASE_PATH;
+      assert.throws(() => createDatabase(), /requires an explicit DATABASE_PATH/);
+
+      process.env.DATABASE_PATH = dbPath;
+      assert.throws(() => createDatabase(), /does not exist or is empty/);
+      assert.throws(() => createDatabase(':memory:'), /cannot use an in-memory/);
+
+      const db = createDatabase(dbPath, { allowCreate: true, seed: false });
+      assert.equal(db.prepare('SELECT COUNT(*) AS count FROM products').get().count, 0);
+      assert.equal(db.prepare('SELECT COUNT(*) AS count FROM categories').get().count, 0);
+      db.close();
+    } finally {
+      if (previousNodeEnv === undefined) delete process.env.NODE_ENV;
+      else process.env.NODE_ENV = previousNodeEnv;
+      if (previousDatabasePath === undefined) delete process.env.DATABASE_PATH;
+      else process.env.DATABASE_PATH = previousDatabasePath;
+    }
+  });
+
   it('initializes the schema, migration metadata, and deterministic seed data', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'stockpilot-seed-'));
     const dbPath = path.join(dir, 'stockpilot.db');
@@ -1228,7 +1277,7 @@ describe('Database foundation', () => {
     assert.ok(db.prepare('SELECT 1 FROM schema_migrations LIMIT 1').get());
 
     const migrationCount = db.prepare('SELECT COUNT(*) AS count FROM schema_migrations').get().count;
-    assert.equal(migrationCount, 6);
+    assert.equal(migrationCount, 7);
     for (const table of ['invoices', 'invoice_items', 'payments', 'sales_returns', 'sales_return_items', 'refunds']) {
       assert.ok(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(table));
     }
@@ -1268,6 +1317,52 @@ describe('Database foundation', () => {
     `).get();
     assert.deepEqual(reopenedCounts, counts);
     reopenedDb.close();
+  });
+
+  it('adds analytics date indexes from the prior schema version without changing records', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'stockpilot-v7-'));
+    const dbPath = path.join(dir, 'stockpilot.db');
+    const initialDb = createDatabase(dbPath);
+    const before = initialDb.prepare(`
+      SELECT
+        (SELECT COUNT(*) FROM products) AS products,
+        (SELECT COUNT(*) FROM stock_movements) AS movements,
+        (SELECT sku FROM products WHERE sku = 'MUG-001') AS seededSku
+    `).get();
+    initialDb.exec(`
+      DROP INDEX idx_stock_movements_created_at;
+      DROP INDEX idx_goods_receipts_received_at;
+      DROP INDEX idx_invoices_date_status;
+      DROP INDEX idx_payments_date_status;
+      DROP INDEX idx_sales_returns_date_status;
+      DROP INDEX idx_refunds_created_status;
+      DROP INDEX idx_refunds_completed_status;
+      DELETE FROM schema_migrations WHERE version = 7;
+    `);
+    initialDb.close();
+
+    const migratedDb = createDatabase(dbPath);
+    const after = migratedDb.prepare(`
+      SELECT
+        (SELECT COUNT(*) FROM products) AS products,
+        (SELECT COUNT(*) FROM stock_movements) AS movements,
+        (SELECT sku FROM products WHERE sku = 'MUG-001') AS seededSku
+    `).get();
+    assert.deepEqual(after, before);
+    assert.equal(migratedDb.prepare('SELECT MAX(version) AS version FROM schema_migrations').get().version, 7);
+    for (const indexName of [
+      'idx_stock_movements_created_at',
+      'idx_goods_receipts_received_at',
+      'idx_invoices_date_status',
+      'idx_payments_date_status',
+      'idx_sales_returns_date_status',
+      'idx_refunds_created_status',
+      'idx_refunds_completed_status',
+    ]) {
+      assert.ok(migratedDb.prepare("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?").get(indexName));
+    }
+    assert.ok(fs.readdirSync(dir).some((name) => name.startsWith('stockpilot.db.bak-')));
+    migratedDb.close();
   });
 
   it('migrates legacy databases without resetting preserved records', async () => {
@@ -1330,7 +1425,7 @@ describe('Database foundation', () => {
     assert.ok(files.some((name) => name.startsWith('stockpilot.db.bak-')));
 
     const migrationVersion = migratedDb.prepare('SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1').get().version;
-    assert.equal(migrationVersion, 6);
+    assert.equal(migrationVersion, 7);
     assert.equal(migratedDb.pragma('foreign_key_check').length, 0);
     migratedDb.close();
   });
@@ -1398,5 +1493,386 @@ describe('Database foundation', () => {
     db.prepare('UPDATE products SET quantity = quantity + 1 WHERE id = ?').run(product.id);
     assert.equal(getStockReconciliationReport(db).find((row) => row.id === product.id).reconciled, 0);
     db.close();
+  });
+});
+
+describe('Analytics APIs', () => {
+  let db;
+  let client;
+
+  beforeEach(() => {
+    db = createDatabase(':memory:');
+    client = request(createApp({ db }));
+  });
+
+  afterEach(() => db.close());
+
+  const utcToday = () => new Date().toISOString().slice(0, 10);
+
+  async function createAnalyticsProduct(overrides = {}) {
+    const response = await client.post('/api/products').send({
+      sku: 'ANALYTICS-1',
+      name: 'Analytics Product',
+      category: 'Analytics',
+      price: 10,
+      quantity: 10,
+      lowStockThreshold: 3,
+      unitCost: 2.5,
+      ...overrides,
+    });
+    assert.equal(response.status, 201, JSON.stringify(response.body));
+    return response.body.product;
+  }
+
+  it('returns correctly shaped zero-valued analytics for an empty database', async () => {
+    const range = { from: utcToday(), to: utcToday() };
+    const overview = await client.get('/api/analytics/overview').query(range);
+    assert.equal(overview.status, 200);
+    assert.equal(overview.body.inventory.activeProductCount, 0);
+    assert.equal(overview.body.inventory.totalProductCount, 0);
+    assert.equal(overview.body.inventory.totalUnitsInStock, 0);
+    assert.equal(overview.body.inventory.inventoryValuation, 0);
+    assert.equal(overview.body.sales.orderCount, 0);
+    assert.equal(overview.body.sales.averageOrderValue, 0);
+    assert.equal(overview.body.financials.outstandingReceivables, 0);
+    assert.deepEqual(overview.body.sales.recentSales, []);
+    assert.deepEqual(overview.body.recentStockMovements, []);
+    assert.deepEqual(overview.body.returnsAndRefunds.returns.byStatus, []);
+    assert.deepEqual(overview.body.returnsAndRefunds.refunds.byStatus, []);
+
+    const inventory = await client.get('/api/analytics/inventory');
+    assert.equal(inventory.body.products.length, 0);
+    assert.equal(inventory.body.byCategory.length, 0);
+    assert.equal(inventory.body.bySupplier.length, 0);
+    const trend = await client.get('/api/analytics/sales-trend').query({ ...range, period: 'daily' });
+    assert.equal(trend.body.salesTrend.length, 1);
+    assert.equal(trend.body.salesTrend[0].salesValue, 0);
+    const top = await client.get('/api/analytics/top-products').query(range);
+    assert.deepEqual(top.body.products, []);
+    const movements = await client.get('/api/analytics/stock-movements').query(range);
+    assert.deepEqual(movements.body.recentMovements, []);
+    assert.deepEqual(movements.body.movementsByPeriodAndType, []);
+  });
+
+  it('calculates inventory, sales, purchasing, financial and ledger analytics from stored records', async () => {
+    const category = (await client.post('/api/categories').send({ name: 'Analytics Category' })).body.category;
+    const supplierResponse = await client.post('/api/suppliers').send({
+      supplierCode: 'ANALYTICS-SUP',
+      businessName: 'Analytics Supplier',
+    });
+    const supplier = supplierResponse.body.supplier;
+    const product = await createAnalyticsProduct({
+      category: category.name,
+      categoryId: category.id,
+      supplierId: supplier.id,
+    });
+    const outOfStock = await createAnalyticsProduct({
+      sku: 'ANALYTICS-2', name: 'Out of Stock', quantity: 0, unitCost: 5, lowStockThreshold: 1,
+      category: category.name, categoryId: category.id, supplierId: supplier.id,
+    });
+    await createAnalyticsProduct({
+      sku: 'ANALYTICS-3', name: 'Inactive Item', quantity: 2, unitCost: 4,
+      isActive: false, lowStockThreshold: 1, category: 'Legacy Category',
+    });
+
+    const initialInventory = await client.get('/api/analytics/inventory');
+    assert.equal(initialInventory.body.totalUnitsInStock, 12);
+    assert.equal(initialInventory.body.inventoryValuation, 33);
+    assert.equal(initialInventory.body.activeProductCount, 2);
+    assert.equal(initialInventory.body.lowStockCount, 1);
+    assert.equal(initialInventory.body.outOfStockCount, 1);
+    assert.equal(initialInventory.body.outOfStockProducts[0].id, outOfStock.id);
+    assert.equal(initialInventory.body.negativeStockCount, 0);
+    assert.equal(initialInventory.body.lowStockProducts[0].id, outOfStock.id);
+    assert.equal(initialInventory.body.products.find((row) => row.id === product.id).stockValue, 25);
+    assert.equal(initialInventory.body.byCategory.find((row) => row.categoryId === category.id).inventoryValue, 25);
+    assert.equal(initialInventory.body.bySupplier.find((row) => row.supplierId === supplier.id).productCount, 2);
+
+    const orderResponse = await client.post('/api/orders').send({
+      items: [{ productId: product.id, quantity: 2 }],
+    });
+    assert.equal(orderResponse.status, 201);
+    const order = orderResponse.body.order;
+    const invoiceDraft = await client.post('/api/invoices').send({ orderId: order.id });
+    assert.equal(invoiceDraft.status, 201);
+    const invoice = (await client.post(`/api/invoices/${invoiceDraft.body.invoice.id}/issue`)).body.invoice;
+    const paymentResponse = await client.post(`/api/invoices/${invoice.id}/payments`).send({ amount: 5, method: 'cash' });
+    assert.equal(paymentResponse.status, 201);
+    const orderItemId = db.prepare('SELECT id FROM order_items WHERE order_id = ?').get(order.id).id;
+    const returnResponse = await client.post('/api/returns').send({
+      orderId: order.id,
+      invoiceId: invoice.id,
+      reason: 'Analytics return',
+      items: [{ orderItemId, quantity: 1, restockable: true, restockReason: 'Inspected for resale' }],
+    });
+    assert.equal(returnResponse.status, 201);
+    const salesReturn = returnResponse.body.salesReturn;
+    assert.equal((await client.post(`/api/returns/${salesReturn.id}/complete`).send({ status: 'accepted' })).status, 200);
+    const refundResponse = await client.post(`/api/returns/${salesReturn.id}/refunds`).send({
+      paymentId: paymentResponse.body.payment.id,
+      amount: 4,
+      method: 'cash',
+    });
+    assert.equal(refundResponse.status, 201);
+    assert.equal((await client.post(`/api/refunds/${refundResponse.body.refund.id}/complete`)).status, 200);
+
+    const purchaseOrder = await client.post('/api/purchase-orders').send({
+      supplierId: supplier.id,
+      items: [{ productId: product.id, quantity: 3, unitCost: 2.5 }],
+    });
+    assert.equal(purchaseOrder.status, 201);
+    assert.equal((await client.post(`/api/purchase-orders/${purchaseOrder.body.purchaseOrder.id}/submit`)).status, 200);
+
+    const range = { from: utcToday(), to: utcToday() };
+    const overview = await client.get('/api/analytics/overview').query(range);
+    assert.equal(overview.status, 200);
+    assert.equal(overview.body.inventory.totalUnitsInStock, 11);
+    assert.equal(overview.body.inventory.inventoryValuation, 30.5);
+    assert.equal(overview.body.inventory.totalProductCount, 3);
+    assert.equal(overview.body.sales.orderCount, 1);
+    assert.equal(overview.body.sales.salesValue, 20);
+    assert.equal(overview.body.sales.averageOrderValue, 20);
+    assert.equal(overview.body.sales.recentSales[0].id, order.id);
+    assert.ok(overview.body.recentStockMovements.some((row) => row.movementType === 'sale'));
+    assert.equal(overview.body.purchasing.purchaseOrderCount, 1);
+    assert.equal(overview.body.purchasing.purchaseTrend[0].orderCount, 1);
+    assert.equal(overview.body.purchasing.purchaseTrend[0].purchaseValue, 7.5);
+    assert.equal(overview.body.financials.invoicesIssued, 20);
+    assert.equal(overview.body.financials.paymentsReceived, 5);
+    assert.equal(overview.body.financials.acceptedReturnCredits, 10);
+    assert.equal(overview.body.financials.completedRefunds, 4);
+    assert.equal(overview.body.financials.outstandingReceivables, 5);
+    assert.ok(overview.body.financials.paymentStatusDistribution.some((row) => row.status === 'completed' && row.count === 1));
+    assert.equal(overview.body.returnsAndRefunds.returns.acceptedReturnCredits, 10);
+    assert.equal(overview.body.returnsAndRefunds.refunds.completedAmount, 4);
+
+    const trend = await client.get('/api/analytics/sales-trend').query({ ...range, period: 'daily' });
+    assert.equal(trend.body.salesTrend[0].orderCount, 1);
+    assert.equal(trend.body.salesTrend[0].averageOrderValue, 20);
+    const weeklyTrend = await client.get('/api/analytics/sales-trend').query({ ...range, period: 'weekly' });
+    assert.equal(weeklyTrend.body.salesTrend[0].orderCount, 1);
+    const monthlyTrend = await client.get('/api/analytics/sales-trend').query({ ...range, period: 'monthly' });
+    assert.equal(monthlyTrend.body.salesTrend[0].orderCount, 1);
+    const top = await client.get('/api/analytics/top-products').query({ ...range, limit: 5 });
+    assert.equal(top.body.products[0].sku, product.sku);
+    assert.equal(top.body.products[0].unitsSold, 2);
+    assert.equal(top.body.products[0].salesValue, 20);
+    assert.equal(top.body.products[0].orderCount, 1);
+
+    const movements = await client.get('/api/analytics/stock-movements').query(range);
+    assert.ok(movements.body.movementsByPeriodAndType.some((row) => row.movement_type === 'sale' && row.outbound_quantity === 2));
+    assert.ok(movements.body.movementsByPeriodAndType.some((row) => row.movement_type === 'return_in' && row.inbound_quantity === 1));
+    assert.ok(movements.body.recentMovements.some((row) => row.movementType === 'return_in' && row.productId === product.id));
+
+    const cancelledOrder = await client.post('/api/orders').send({ items: [{ productId: product.id, quantity: 1 }] });
+    assert.equal(cancelledOrder.status, 201);
+    assert.equal((await client.patch(`/api/orders/${cancelledOrder.body.order.id}/status`).send({ status: 'cancelled' })).status, 200);
+    const afterCancellation = await client.get('/api/analytics/top-products').query(range);
+    assert.equal(afterCancellation.body.products[0].unitsSold, 2);
+  });
+
+  it('validates dates, periods and limits and returns date-boundary results', async () => {
+    const product = await createAnalyticsProduct({ quantity: 3 });
+    assert.equal((await client.post('/api/orders').send({ items: [{ productId: product.id, quantity: 1 }] })).status, 201);
+    const today = utcToday();
+    const boundary = await client.get('/api/analytics/overview').query({ from: today, to: today });
+    assert.equal(boundary.body.sales.orderCount, 1);
+
+    const tomorrow = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+    assert.equal((await client.get('/api/analytics/overview').query({ from: '2026-02-30', to: today })).status, 400);
+    assert.equal((await client.get('/api/analytics/overview').query({ from: '2026-02-30T00:00:00.000Z', to: today })).status, 400);
+    assert.equal((await client.get('/api/analytics/overview').query({ from: '2026-10-01T00:00:00', to: today })).status, 400);
+    assert.equal((await client.get('/api/analytics/overview').query({ from: tomorrow, to: today })).status, 400);
+    assert.equal((await client.get('/api/analytics/overview').query({ from: '2024-01-01', to: today })).status, 400);
+    assert.equal((await client.get('/api/analytics/sales-trend').query({ period: 'yearly' })).status, 400);
+    assert.equal((await client.get('/api/analytics/top-products').query({ limit: 0 })).status, 400);
+    assert.equal((await client.get('/api/analytics/top-products').query({ limit: 101 })).status, 400);
+    assert.equal((await client.get('/api/analytics/exports/sales-trend.csv').query({ period: 'invalid' })).status, 400);
+    assert.equal((await client.get('/api/analytics/exports/not-real.csv')).status, 404);
+  });
+
+  it('exports quoted CSV values safely and blocks spreadsheet formulas', async () => {
+    const name = ' =HYPERLINK("https://example.invalid","bad"),\nsecond line';
+    const product = await createAnalyticsProduct({ sku: 'CSV-01', name });
+    await createAnalyticsProduct({ sku: 'CSV-02', name: 'Out of stock CSV', quantity: 0 });
+    const secondSoldProduct = await createAnalyticsProduct({ sku: 'CSV-03', name: 'Second sold product' });
+    const response = await client.get('/api/analytics/exports/inventory.csv');
+    assert.equal(response.status, 200);
+    assert.match(response.headers['content-type'], /text\/csv/);
+    assert.match(response.headers['content-disposition'], /inventory-valuation-/);
+    assert.ok(response.text.startsWith('"SKU","Product","Category"'));
+    assert.ok(response.text.includes(`"'=HYPERLINK(""https://example.invalid"",""bad""),\nsecond line"`));
+
+    const lowStock = await client.get('/api/analytics/exports/low-stock.csv');
+    assert.equal(lowStock.status, 200);
+    assert.ok(lowStock.text.startsWith('"SKU","Product","Category"'));
+    const outOfStock = await client.get('/api/analytics/exports/out-of-stock.csv');
+    assert.equal(outOfStock.status, 200);
+    assert.ok(outOfStock.text.startsWith('"SKU","Product","Category"'));
+    const order = await client.post('/api/orders').send({ items: [{ productId: product.id, quantity: 1 }] });
+    assert.equal(order.status, 201);
+    assert.equal((await client.post('/api/orders').send({ items: [{ productId: secondSoldProduct.id, quantity: 1 }] })).status, 201);
+    const top = await client.get('/api/analytics/exports/top-products.csv').query({ from: utcToday(), to: utcToday() });
+    assert.equal(top.status, 200);
+    assert.ok(top.text.startsWith('"SKU","Product","Units sold"'));
+    assert.equal((await client.get('/api/analytics/exports/top-products.csv').query({ from: utcToday(), to: utcToday(), limit: 1 })).status, 400);
+    const trend = await client.get('/api/analytics/exports/sales-trend.csv').query({ from: utcToday(), to: utcToday() });
+    assert.equal(trend.status, 200);
+    assert.ok(trend.text.startsWith('"Period","Qualifying orders"'));
+    const movements = await client.get('/api/analytics/exports/stock-movements.csv').query({ from: utcToday(), to: utcToday() });
+    assert.equal(movements.status, 200);
+    assert.ok(movements.text.startsWith('"Timestamp","Movement type"'));
+    const tooMany = await client.get('/api/analytics/exports/inventory.csv').query({ limit: 1 });
+    assert.equal(tooMany.status, 400);
+  });
+
+  it('reports filtered returns, receipt values, supplier performance, inventory warnings, and stays read-only', async () => {
+    const categoryResponse = await client.post('/api/categories').send({ name: 'Analytics Readonly Category' });
+    const supplierResponse = await client.post('/api/suppliers').send({
+      supplierCode: 'ANALYTICS-READONLY-SUP',
+      businessName: 'Analytics Readonly Supplier',
+    });
+    assert.equal(categoryResponse.status, 201);
+    assert.equal(supplierResponse.status, 201);
+    const category = categoryResponse.body.category;
+    const supplier = supplierResponse.body.supplier;
+    const product = await createAnalyticsProduct({
+      sku: 'ANALYTICS-READONLY-1',
+      name: 'Analytics Readonly Product',
+      categoryId: category.id,
+      category: category.name,
+      supplierId: supplier.id,
+      quantity: 8,
+      price: 10,
+      unitCost: 4,
+    });
+    const missingCost = await createAnalyticsProduct({
+      sku: 'ANALYTICS-READONLY-2',
+      name: 'Missing Cost Product',
+      categoryId: category.id,
+      category: category.name,
+      supplierId: supplier.id,
+      quantity: 2,
+      unitCost: null,
+      price: 12,
+    });
+    const orderResponse = await client.post('/api/orders').send({ items: [{ productId: product.id, quantity: 2 }] });
+    assert.equal(orderResponse.status, 201);
+    const orderItemId = db.prepare('SELECT id FROM order_items WHERE order_id = ?').get(orderResponse.body.order.id).id;
+    const returnResponse = await client.post('/api/returns').send({
+      orderId: orderResponse.body.order.id,
+      reason: 'Analytics return',
+      items: [{ orderItemId, quantity: 1, restockable: true, restockReason: 'Passed inspection' }],
+    });
+    assert.equal(returnResponse.status, 201);
+    assert.equal((await client.post(`/api/returns/${returnResponse.body.salesReturn.id}/complete`).send({ status: 'accepted' })).status, 200);
+    const purchaseOrderResponse = await client.post('/api/purchase-orders').send({
+      supplierId: supplier.id,
+      items: [{ productId: product.id, quantity: 3, unitCost: 4 }],
+    });
+    assert.equal(purchaseOrderResponse.status, 201);
+    const purchaseOrder = purchaseOrderResponse.body.purchaseOrder;
+    assert.equal((await client.post(`/api/purchase-orders/${purchaseOrder.id}/submit`)).status, 200);
+    const receiptResponse = await client.post(`/api/purchase-orders/${purchaseOrder.id}/receipts`).send({
+      receiptNumber: 'ANALYTICS-READONLY-GR-1',
+      items: [{ purchaseOrderItemId: purchaseOrder.items[0].id, quantity: 1 }],
+    });
+    assert.equal(receiptResponse.status, 201, JSON.stringify(receiptResponse.body));
+    const invoiceResponse = await client.post('/api/invoices').send({ orderId: orderResponse.body.order.id });
+    assert.equal(invoiceResponse.status, 201);
+    assert.equal((await client.post(`/api/invoices/${invoiceResponse.body.invoice.id}/issue`)).status, 200);
+    const paymentResponse = await client.post(`/api/invoices/${invoiceResponse.body.invoice.id}/payments`).send({
+      amount: 5,
+      method: 'cash',
+    });
+    assert.equal(paymentResponse.status, 201);
+
+    const businessTables = [
+      'categories', 'suppliers', 'products', 'orders', 'order_items', 'stock_movements',
+      'purchase_orders', 'purchase_order_items', 'goods_receipts', 'goods_receipt_items',
+      'invoices', 'invoice_items', 'payments', 'sales_returns', 'sales_return_items', 'refunds',
+    ];
+    const snapshot = () => JSON.stringify(Object.fromEntries(businessTables.map((table) => [
+      table,
+      db.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all(),
+    ])));
+    const before = snapshot();
+    const range = { from: utcToday(), to: utcToday(), categoryId: String(category.id), supplierId: String(supplier.id) };
+    const inventory = await client.get('/api/analytics/inventory').query({ ...range, windowDays: 60 });
+    assert.equal(inventory.status, 200, JSON.stringify(inventory.body));
+    assert.equal(inventory.body.retailValue, 104);
+    assert.equal(inventory.body.missingCostCount, 1);
+    assert.equal(inventory.body.slowMovement.windowDays, 60);
+    assert.deepEqual(inventory.body.reconciliationWarnings, []);
+    assert.equal(inventory.body.products.some((row) => row.id === missingCost.id), true);
+
+    const sales = await client.get('/api/analytics/sales-trend').query({ ...range, period: 'daily' });
+    assert.equal(sales.status, 200, JSON.stringify(sales.body));
+    assert.equal(sales.body.grossSalesValue, 20);
+    assert.equal(sales.body.acceptedReturnCredits, 10);
+    assert.equal(sales.body.netSalesValue, 10);
+    assert.equal(sales.body.byCategory[0].netUnitsSold, 1);
+    assert.ok(sales.body.statusBreakdown.some((row) => row.status === 'confirmed' && row.orderCount === 1));
+    const financials = await client.get('/api/analytics/financials').query({ from: utcToday(), to: utcToday() });
+    assert.equal(financials.status, 200, JSON.stringify(financials.body));
+    assert.equal(financials.body.unsettledReturnCredits, 10);
+    assert.equal(financials.body.netCashRetained, 5);
+    const top = await client.get('/api/analytics/top-products').query({ ...range, limit: 5 });
+    assert.equal(top.status, 200, JSON.stringify(top.body));
+    assert.equal(top.body.products[0].netUnitsSold, 1);
+
+    const purchasing = await client.get('/api/analytics/purchasing').query({ ...range, period: 'daily' });
+    assert.equal(purchasing.status, 200, JSON.stringify(purchasing.body));
+    assert.equal(purchasing.body.purchaseOrderCount, 1);
+    assert.equal(purchasing.body.orderedQuantity, 3);
+    assert.equal(purchasing.body.receivedQuantity, 1);
+    assert.equal(purchasing.body.receivedValue, 4);
+    assert.equal(purchasing.body.outstandingQuantity, 2);
+    assert.equal(purchasing.body.receivingTrend[0].receivedQuantity, 1);
+    assert.equal(purchasing.body.receivingTrend[0].receivedValue, 4);
+    assert.equal(purchasing.body.suppliers[0].supplierId, supplier.id);
+    assert.equal(purchasing.body.suppliers[0].receivedQuantity, 1);
+    assert.ok(purchasing.body.suppliers[0].averageDaysToFirstReceipt >= 0);
+
+    for (const path of [
+      `/api/analytics/overview?from=${utcToday()}&to=${utcToday()}&categoryId=${category.id}&supplierId=${supplier.id}`,
+      `/api/analytics/financials?from=${utcToday()}&to=${utcToday()}`,
+      `/api/analytics/recent-sales?from=${utcToday()}&to=${utcToday()}&limit=1`,
+      `/api/analytics/out-of-stock?categoryId=${category.id}`,
+      `/api/analytics/returns-refunds?from=${utcToday()}&to=${utcToday()}`,
+      `/api/analytics/status-distribution?from=${utcToday()}&to=${utcToday()}`,
+      `/api/analytics/stock-movements?from=${utcToday()}&to=${utcToday()}&productId=${product.id}`,
+      `/api/analytics/exports/inventory.csv?categoryId=${category.id}`,
+      `/api/analytics/exports/low-stock.csv?supplierId=${supplier.id}`,
+      `/api/analytics/exports/out-of-stock.csv?supplierId=${supplier.id}`,
+      `/api/analytics/exports/top-products.csv?from=${utcToday()}&to=${utcToday()}&productId=${product.id}`,
+      `/api/analytics/exports/sales-trend.csv?from=${utcToday()}&to=${utcToday()}&supplierId=${supplier.id}`,
+      `/api/analytics/exports/sales-by-category.csv?from=${utcToday()}&to=${utcToday()}&categoryId=${category.id}`,
+      `/api/analytics/exports/sales-summary.csv?from=${utcToday()}&to=${utcToday()}&categoryId=${category.id}`,
+      `/api/analytics/exports/supplier-purchases.csv?from=${utcToday()}&to=${utcToday()}&supplierId=${supplier.id}`,
+      `/api/analytics/exports/purchases-by-supplier.csv?from=${utcToday()}&to=${utcToday()}&supplierId=${supplier.id}`,
+      `/api/analytics/exports/purchasing-trend.csv?from=${utcToday()}&to=${utcToday()}&supplierId=${supplier.id}`,
+      `/api/analytics/exports/order-status.csv?from=${utcToday()}&to=${utcToday()}`,
+      `/api/analytics/exports/invoice-payment-status.csv?from=${utcToday()}&to=${utcToday()}`,
+      `/api/analytics/exports/returns-refunds.csv?from=${utcToday()}&to=${utcToday()}`,
+      `/api/analytics/exports/stock-movements.csv?from=${utcToday()}&to=${utcToday()}&productId=${product.id}`,
+    ]) {
+      const response = await client.get(path);
+      assert.equal(response.status, 200, `${path}: ${JSON.stringify(response.body)}`);
+    }
+    const recentSales = await client.get('/api/analytics/recent-sales').query({ from: utcToday(), to: utcToday(), limit: 1 });
+    assert.equal(recentSales.body.orders.length, 1);
+    assert.equal(recentSales.body.orders[0].id, orderResponse.body.order.id);
+    const outOfStockReport = await client.get('/api/analytics/out-of-stock').query({ categoryId: category.id });
+    assert.equal(outOfStockReport.body.total, 0);
+    const statusDistribution = await client.get('/api/analytics/status-distribution').query({ from: utcToday(), to: utcToday() });
+    assert.ok(statusDistribution.body.returnStatusDistribution.some((row) => row.status === 'accepted'));
+    assert.ok(statusDistribution.body.paymentStatusDistribution.some((row) => row.status === 'completed'));
+    assert.equal((await client.get('/api/analytics/inventory').query({ categoryId: '2bad' })).status, 400);
+    assert.equal((await client.get('/api/analytics/inventory').query({ supplierId: '1.5' })).status, 400);
+    assert.equal((await client.get('/api/analytics/inventory').query({ productId: '1 OR 1=1' })).status, 400);
+    assert.equal((await client.get('/api/analytics/recent-sales').query({ limit: '1;DROP TABLE products' })).status, 400);
+    assert.equal((await client.get('/api/analytics/inventory').query({ windowDays: 366 })).status, 400);
+    assert.equal(snapshot(), before, 'Analytics reads must not mutate business records.');
   });
 });

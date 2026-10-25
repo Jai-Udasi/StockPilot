@@ -1,0 +1,320 @@
+[1mdiff --git a/README.md b/README.md[m
+[1mindex e8a1b25..89ff37b 100644[m
+[1m--- a/README.md[m
+[1m+++ b/README.md[m
+[36m@@ -37,7 +37,9 @@[m [mFor a production frontend build, run `npm run build`. Start the API with `npm st[m
+ - Product names, SKUs, and prices are snapshotted on order items. Products with order or stock-movement history cannot be deleted, preserving the history.[m
+ - Dashboard summaries include on-hand inventory value, units, current-month orders and sales, recent orders, and low-stock alerts.[m
+ - Request bodies are validated and invalid input, duplicate SKUs, missing records, insufficient stock, and database errors receive explicit API error responses.[m
+[31m-- Responsive dashboard, product catalog, stock-update dialog, order composer, and mobile navigation.[m
+[32m+[m[32m- Responsive, API-connected workspace with dashboard, product inventory, categories, suppliers, customers, sales orders, purchase orders, goods receipts, stock movements, invoices, payments, returns, and refunds.[m
+[32m+[m[32m- Connected dialogs submit real API mutations, show validation/network errors, and refresh affected lists. Order and receipt quantities, invoice balances, return eligibility, and refund eligibility are sourced from persisted backend records.[m
+[32m+[m[32m- Paginated transaction lists, search and filters where supported by the APIs, status-aware actions, confirmation dialogs for consequential transitions, and responsive mobile navigation.[m
+ [m
+ ## REST API[m
+ [m
+[1mdiff --git a/src/App.jsx b/src/App.jsx[m
+[1mindex e78ae45..21bf4f9 100644[m
+[1m--- a/src/App.jsx[m
+[1m+++ b/src/App.jsx[m
+[36m@@ -1,485 +1,5 @@[m
+[31m-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';[m
+[31m-import {[m
+[31m-  AlertTriangle,[m
+[31m-  ArrowRight,[m
+[31m-  Bell,[m
+[31m-  Boxes,[m
+[31m-  Check,[m
+[31m-  ChevronDown,[m
+[31m-  CircleDollarSign,[m
+[31m-  ClipboardList,[m
+[31m-  Command,[m
+[31m-  LayoutDashboard,[m
+[31m-  LoaderCircle,[m
+[31m-  Menu,[m
+[31m-  Minus,[m
+[31m-  Package,[m
+[31m-  Plus,[m
+[31m-  Search,[m
+[31m-  Settings2,[m
+[31m-  ShoppingBag,[m
+[31m-  SlidersHorizontal,[m
+[31m-  Sparkles,[m
+[31m-  Tag,[m
+[31m-  TrendingUp,[m
+[31m-  X,[m
+[31m-} from 'lucide-react';[m
+[32m+[m[32mimport BusinessApp from './BusinessApp.jsx';[m
+ [m
+[31m-const currency = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' });[m
+[31m-const dateFormat = new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric', year: 'numeric' });[m
+[31m-const timeFormat = new Intl.DateTimeFormat('en-US', { hour: 'numeric', minute: '2-digit' });[m
+[31m-[m
+[31m-async function api(path, options = {}) {[m
+[31m-  const response = await fetch(`/api${path}`, {[m
+[31m-    ...options,[m
+[31m-    headers: { 'Content-Type': 'application/json', ...options.headers },[m
+[31m-  });[m
+[31m-  if (response.status === 204) return null;[m
+[31m-  const body = await response.json();[m
+[31m-  if (!response.ok) throw new Error(body.error || 'Something went wrong.');[m
+[31m-  return body;[m
+[31m-}[m
+[31m-[m
+[31m-const initialProduct = { sku: '', name: '', category: '', price: '', quantity: '', lowStockThreshold: '5' };[m
+[31m-[m
+[31m-function App() {[m
+[31m-  const [page, setPage] = useState('Dashboard');[m
+[31m-  const [dashboard, setDashboard] = useState(null);[m
+[31m-  const [products, setProducts] = useState([]);[m
+[31m-  const [categories, setCategories] = useState([]);[m
+[31m-  const [orders, setOrders] = useState([]);[m
+[31m-  const [loading, setLoading] = useState(true);[m
+[31m-  const [error, setError] = useState('');[m
+[31m-  const [search, setSearch] = useState('');[m
+[31m-  const [category, setCategory] = useState('');[m
+[31m-  const [stockFilter, setStockFilter] = useState('');[m
+[31m-  const [modal, setModal] = useState(null);[m
+[31m-  const [toast, setToast] = useState('');[m
+[31m-  const [mobileNav, setMobileNav] = useState(false);[m
+[31m-  const hasLoaded = useRef(false);[m
+[31m-[m
+[31m-  const refreshDashboard = useCallback(async () => {[m
+[31m-    const result = await api('/dashboard');[m
+[31m-    setDashboard(result);[m
+[31m-  }, []);[m
+[31m-[m
+[31m-  const refreshProducts = useCallback(async () => {[m
+[31m-    const params = new URLSearchParams();[m
+[31m-    if (search.trim()) params.set('q', search.trim());[m
+[31m-    if (category) params.set('category', category);[m
+[31m-    if (stockFilter) params.set('stock', stockFilter);[m
+[31m-    const result = await api(`/products?${params.toString()}`);[m
+[31m-    setProducts(result.products);[m
+[31m-    setCategories(result.categories);[m
+[31m-  }, [search, category, stockFilter]);[m
+[31m-[m
+[31m-  const refreshOrders = useCallback(async () => {[m
+[31m-    const result = await api('/orders');[m
+[31m-    setOrders(result.orders);[m
+[31m-  }, []);[m
+[31m-[m
+[31m-  const refreshAll = useCallback(async () => {[m
+[31m-    setError('');[m
+[31m-    setLoading(true);[m
+[31m-    try {[m
+[31m-      await Promise.all([refreshDashboard(), refreshProducts(), refreshOrders()]);[m
+[31m-    } catch (requestError) {[m
+[31m-      setError(requestError.message);[m
+[31m-    } finally {[m
+[31m-      setLoading(false);[m
+[31m-    }[m
+[31m-  }, [refreshDashboard, refreshProducts, refreshOrders]);[m
+[31m-[m
+[31m-  useEffect(() => {[m
+[31m-    refreshAll().finally(() => { hasLoaded.current = true; });[m
+[31m-  }, []);[m
+[31m-[m
+[31m-  useEffect(() => {[m
+[31m-    if (!hasLoaded.current) return undefined;[m
+[31m-    const timer = window.setTimeout(() => {[m
+[31m-      refreshProducts().catch((requestError) => setError(requestError.message));[m
+[31m-    }, 180);[m
+[31m-    return () => window.clearTimeout(timer);[m
+[31m-  }, [refreshProducts]);[m
+[31m-[m
+[31m-  useEffect(() => {[m
+[31m-    if (!toast) return undefined;[m
+[31m-    const timer = window.setTimeout(() => setToast(''), 3200);[m
+[31m-    return () => window.clearTimeout(timer);[m
+[31m-  }, [toast]);[m
+[31m-[m
+[31m-  const handleMutation = async (action, message) => {[m
+[31m-    try {[m
+[31m-      await action();[m
+[31m-      await refreshAll();[m
+[31m-      setModal(null);[m
+[31m-      setToast(message);[m
+[31m-    } catch (requestError) {[m
+[31m-      setError(requestError.message);[m
+[31m-      throw requestError;[m
+[31m-    }[m
+[31m-  };[m
+[31m-[m
+[31m-  const navItems = [[m
+[31m-    { label: 'Dashboard', icon: LayoutDashboard },[m
+[31m-    { label: 'Products', icon: Package },[m
+[31m-    { label: 'Orders', icon: ClipboardList },[m
+[31m-  ];[m
+[31m-[m
+[31m-  const changePage = (nextPage) => {[m
+[31m-    setPage(nextPage);[m
+[31m-    setMobileNav(false);[m
+[31m-    setError('');[m
+[31m-  };[m
+[31m-[m
+[31m-  return ([m
+[31m-    <div className="app-shell">[m
+[31m-      <aside className={`sidebar ${mobileNav ? 'sidebar-open' : ''}`}>[m
+[31m-        <a className="brand" href="#" onClick={(event) => { event.preventDefault(); changePage('Dashboard'); }}>[m
+[31m-          <span className="brand-mark"><Command size={19} strokeWidth={2.6} /></span>[m
+[31m-          <span>stock<span className="brand-light">pilot</span></span>[m
+[31m-          <span className="brand-plan">STUDIO</span>[m
+[31m-        </a>[m
+[31m-        <div className="workspace">[m
+[31m-          <span className="workspace-avatar">M</span>[m
+[31m-          <span className="workspace-copy"><strong>Maple & Moss</strong><small>Workspace</small></span>[m
+[31m-          <ChevronDown size={15} />[m
+[31m-        </div>[m
+[31m-        <span className="nav-caption">WORKSPACE</span>[m
+[31m-        <nav className="primary-nav" aria-label="Main navigation">[m
+[31m-          {navItems.map((item) => {[m
+[31m-            const Icon = item.icon;[m
+[31m-            return ([m
+[31m-              <button className={`nav-link ${page === item.label ? 'active' : ''}`} key={item.label} onClick={() => changePage(item.label)}>[m
+[31m-                <Icon size={17} strokeWidth={1.8} /><span>{item.label}</span>[m
+[31m-                {item.label === 'Products' && dashboard?.lowStockCount > 0 && <span className="nav-count">{dashboard.lowStockCount}</span>}[m
+[31m-              </button>[m
+[31m-            );[m
+[31m-          })}[m
+[31m-        </nav>[m
+[31m-        <div className="sidebar-bottom">[m
+[31m-          <div className="sidebar-tip">[m
+[31m-            <span className="tip-icon"><Sparkles size={15} /></span>[m
+[31m-            <strong>Good things are in stock.</strong>[m
+[31m-            <p>Keep your bestsellers ready for the next order.</p>[m
+[31m-            <button onClick={() => { changePage('Products'); setModal({ type: 'product' }); }}>Add a product <ArrowRight size={14} /></button>[m
+[31m-          </div>[m
+[31m-          <button className="nav-link settings-link" onClick={() => setToast('You’re all set — settings are coming soon.')}><Settings2 size={17} /><span>Settings</span></button>[m
+[31m-          <div className="profile-row">[m
+[31m-            <span className="profile-avatar">JD</span>[m
+[31m-            <span className="profile-copy"><strong>Jamie Dawson</strong><small>Store owner</small></span>[m
+[31m-            <ChevronDown size={15} />[m
+[31m-          </div>[m
+[31m-        </div>[m
+[31m-      </aside>[m
+[31m-[m
+[31m-      {mobileNav && <button className="nav-scrim" aria-label="Close navigation" onClick={() => setMobileNav(false)} />}[m
+[31m-      <main className="main-area">[m
+[31m-        <header className="topbar">[m
+[31m-          <button className="mobile-menu icon-button" aria-label="Open navigation" onClick={() => setMobileNav(true)}><Menu size={20} /></button>[m
+[31m-          <div className="breadcrumbs"><span>Workspace</span><span className="crumb-slash">/</span><strong>{page}</strong></div>[m
+[31m-          <div className="topbar-right">[m
+[31m-            <div className="global-search"><Search size={15} /><input aria-label="Search products" placeholder="Search anything..." value={search} onChange={(event) => { setSearch(event.target.value); if (page !== 'Products') setPage('Products'); }} /><kbd>⌘ K</kbd></div>[m
+[31m-            <button className="icon-button notification-button" aria-label="Low stock alerts" onClick={() => { changePage('Products'); setStockFilter('low'); }}><Bell size={18} />{dashboard?.lowStockCount > 0 && <i />}</button>[m
+[31m-            <span className="topbar-divider" />[m
+[31m-            <span className="top-date">{new Intl.DateTimeFormat('en-US', { weekday: 'short', month: 'short', day: 'numeric' }).format(new Date())}</span>[m
+[31m-          </div>[m
+[31m-        </header>[m
+[31m-[m
+[31m-        <div className="content-wrap">[m
+[31m-          {error && <div className="error-banner" role="alert"><AlertTriangle size={17} /><span>{error}</span><button aria-label="Dismiss error" onClick={() => setError('')}><X size={16} /></button></div>}[m
+[31m-          {loading ? <LoadingState /> : ([m
+[31m-            <>[m
+[31m-              {page === 'Dashboard' && <DashboardPage dashboard={dashboard} onNavigate={changePage} onModal={setModal} />}[m
+[31m-              {page === 'Products' && ([m
+[31m-                <ProductsPage[m
+[31m-                  products={products}[m
+[31m-                  categories={categories}[m
+[31m-                  search={search}[m
+[31m-                  category={category}[m
+[31m-                  stockFilter={stockFilter}[m
+[31m-                  onSearch={setSearch}[m
+[31m-                  onCategory={setCategory}[m
+[31m-                  onStockFilter={setStockFilter}[m
+[31m-                  onModal={setModal}[m
+[31m-                  onDelete={(product) => setModal({ type: 'delete', product })}[m
+[31m-                />[m
+[31m-              )}[m
+[31m-              {page === 'Orders' && <OrdersPage orders={orders} onModal={setModal} />}[m
+[31m-            </>[m
+[31m-          )}[m
+[31m-        </div>[m
+[31m-      </main>[m
+[31m-[m
+[31m-      {modal && ([m
+[31m-        <Modal onClose={() => setModal(null)} title={modal.type === 'product' ? (modal.product ? 'Edit product' : 'Add a product') : modal.type === 'stock' ? 'Update stock' : modal.type === 'order' ? 'Create an order' : 'Delete product'}>[m
+[31m-          {modal.type === 'product' && <ProductForm product={modal.product} onCancel={() => setModal(null)} onSubmit={(data) => handleMutation(() => api(modal.product ? `/products/${modal.product.id}` : '/products', { method: modal.product ? 'PUT' : 'POST', body: JSON.stringify(data) }), modal.product ? 'Product details updated.' : 'Product added to your inventory.')} />}[m
+[31m-          {modal.type === 'stock' && <StockForm product={modal.product} onCancel={() => setModal(null)} onSubmit={(data) => handleMutation(() => api(`/products/${modal.product.id}/stock`, { method: 'PATCH', body: JSON.stringify(data) }), 'Stock levels updated.')} />}[m
+[31m-          {modal.type === 'order' && <OrderForm products={products} onCancel={() => setModal(null)} onSubmit={(data) => handleMutation(() => api('/orders', { method: 'POST', body: JSON.stringify(data) }), 'Order placed and inventory updated.')} />}[m
+[31m-          {modal.type === 'delete' && <DeleteConfirm product={modal.product} onCancel={() => setModal(null)} onDelete={() => handleMutation(() => api(`/products/${modal.product.id}`, { method: 'DELETE' }), 'Product deleted.')} />}[m
+[31m-        </Modal>[m
+[31m-      )}[m
+[31m-      {toast && <div className="toast" role="status"><span><Check size={15} /></span>{toast}</div>}[m
+[31m-    </div>[m
+[31m-  );[m
+[31m-}[m
+[31m-[m
+[31m-function LoadingState() {[m
+[31m-  return <div className="loading-state"><LoaderCircle size={25} className="spin" /><span>Getting your workspace ready…</span></div>;[m
+[31m-}[m
+[31m-[m
+[31m-function PageHeading({ eyebrow, title, description, action, icon: Icon }) {[m
+[31m-  return ([m
+[31m-    <div className="page-heading">[m
+[31m-      <div>[m
+[31m-        <div className="eyebrow">{eyebrow}</div>[m
+[31m-        <h1>{title}</h1>[m
+[31m-        <p>{description}</p>[m
+[31m-      </div>[m
+[31m-      {action && <button className="button button-primary" onClick={action.onClick}>{Icon && <Icon size={16} />}{action.label}</button>}[m
+[31m-    </div>[m
+[31m-  );[m
+[32m+[m[32mexport default function App() {[m
+[32m+[m[32m  return <BusinessApp />;[m
+ }[m
+[31m-[m
+[31m-function DashboardPage({ dashboard, onNavigate, onModal }) {[m
+[31m-  if (!dashboard) return null;[m
+[31m-  const stats = [[m
+[31m-    { label: 'Inventory value', value: currency.format(dashboard.inventoryValue), note: 'Across all products', icon: CircleDollarSign, tone: 'mint', change: 'On hand' },[m
+[31m-    { label: 'Total products', value: dashboard.productCount.toLocaleString(), note: 'Unique items in catalog', icon: Package, tone: 'peach', change: 'In catalog' },[m
+[31m-    { label: 'Units in stock', value: dashboard.unitsInStock.toLocaleString(), note: 'Ready to be sold', icon: Boxes, tone: 'lavender', change: 'Available' },[m
+[31m-    { label: 'Orders this month', value: dashboard.monthlyOrderCount.toLocaleString(), note: `${currency.format(dashboard.monthlyRevenue)} in sales`, icon: TrendingUp, tone: 'blue', change: 'This month' },[m
+[31m-  ];[m
+[31m-  return ([m
+[31m-    <>[m
+[31m-      <PageHeading eyebrow={new Intl.DateTimeFormat('en-US', { weekday: 'long', month: 'long', day: 'numeric' }).format(new Date()).toUpperCase()} title="Your business, at a glance." description="Here’s what’s happening with your inventory today." action={{ label: 'New order', onClick: () => onModal({ type: 'order' }) }} icon={Plus} />[m
+[31m-      <div className="welcome-strip">[m
+[31m-        <div className="welcome-art"><span className="art-circle art-one" /><span className="art-circle art-two" /><span className="art-leaf">✳</span><Package size={25} /></div>[m
+[31m-        <div className="welcome-copy"><span className="welcome-kicker">A LITTLE MOMENTUM</span><strong>Your shop is looking good.</strong><p>You’ve got <b>{dashboard.unitsInStock} {dashboard.unitsInStock === 1 ? 'item' : 'items'}</b> ready to go. Keep an eye on your low-stock list and stay one step ahead.</p></div>[m
+[31m-        <button className="welcome-link" onClick={() => onNavigate('Products')}>Explore inventory <ArrowRight size={15} /></button>[m
+[31m-        <span className="welcome-spark spark-a">✦</span><span className="welcome-spark spark-b">·</span>[m
+[31m-      </div>[m
+[31m-      <section className="stats-grid" aria-label="Business summary">[m
+[31m-        {stats.map((stat, index) => {[m
+[31m-          const Icon = stat.icon;[m
+[31m-          return ([m
+[31m-            <article className="stat-card" key={stat.label}>[m
+[31m-              <div className="stat-card-top"><span className={`stat-icon ${stat.tone}`}><Icon size={18} strokeWidth={1.9} /></span><span className="stat-period"><span className="period-dot" />{stat.change}</span></div>[m
+[31m-              <div className="stat-value">{stat.value}</div><div className="stat-label">{stat.label}</div>[m
+[31m-              <div className={`stat-note ${index === 3 ? 'note-accent' : ''}`}>{stat.note}</div>[m
+[31m-            </article>[m
+[31m-          );[m
+[31m-        })}[m
+[31m-      </section>[m
+[31m-      <div className="dashboard-grid">[m
+[31m-        <section className="panel inventory-panel">[m
+[31m-          <div className="panel-heading"><div><div className="panel-title-row"><h2>Stock watch</h2>{dashboard.lowStockCount > 0 && <span className="alert-count">{dashboard.lowStockCount}</span>}</div><p>A little heads-up on what needs a restock.</p></div><button className="text-link" onClick={() => { onNavigate('Products'); }}>View inventory <ArrowRight size={14} /></button></div>[m
+[31m-          {dashboard.lowStockProducts.length ? ([m
+[31m-            <div className="stock-list">[m
+[31m-              {dashboard.lowStockProducts.map((product, index) => ([m
+[31m-                <div className="stock-row" key={product.id}>[m
+[31m-                  <span className={`product-art product-art-${index % 4}`}><Package size={17} /></span>[m
+[31m-                  <span className="stock-product"><strong>{product.name}</strong><small>{product.sku} <span>·</span> {product.category}</small></span>[m
+[31m-                  <span className="stock-status"><span className={`stock-rail ${product.quantity === 0 ? 'rail-empty' : ''}`}><i style={{ width: `${Math.max(8, Math.min(100, product.quantity / Math.max(product.lowStockThreshold, 1) * 100))}%` }} /></span><b className={product.quantity === 0 ? 'out-text' : ''}>{product.quantity} <small>left</small></b></span>[m
+[31m-                </div>[m
+[31m-              ))}[m
+[31m-            </div>[m
+[31m-          ) : <EmptyInline icon={Check} title="All stocked up!" text="Nothing needs your attention right now." />}[m
+[31m-          <button className="panel-footer-link" onClick={() => onNavigate('Products')}><SlidersHorizontal size={14} /> Manage stock levels <ArrowRight size={14} /></button>[m
+[31m-        </section>[m
+[31m-        <section className="panel orders-panel">[m
+[31m-          <div className="panel-heading"><div><h2>Recent orders</h2><p>A fresh look at your latest sales.</p></div><button className="icon-button panel-more" aria-label="View all orders" onClick={() => onNavigate('Orders')}><ArrowRight size={17} /></button></div>[m
+[31m-          {dashboard.recentOrders.length ? ([m
+[31m-            <div className="orders-list">[m
+[31m-              {dashboard.recentOrders.slice(0, 5).map((order, index) => ([m
+[31m-                <div className="order-row" key={order.id}>[m
+[31m-                  <span className={`order-avatar order-avatar-${index % 4}`}>{order.customerName.charAt(0).toUpperCase()}</span>[m
+[31m-                  <span className="order-person"><strong>{order.customerName}</strong><small>{order.orderNumber} · {order.items.reduce((sum, item) => sum + item.quantity, 0)} items</small></span>[m
+[31m-                  <span className="order-price">{currency.format(order.total)}<small>{timeFormat.forma

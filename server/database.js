@@ -510,6 +510,28 @@ const MIGRATIONS = [
       `);
     },
   },
+  {
+    version: 7,
+    name: 'analytics_date_range_indexes',
+    apply(db) {
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS idx_stock_movements_created_at
+          ON stock_movements(created_at, id);
+        CREATE INDEX IF NOT EXISTS idx_goods_receipts_received_at
+          ON goods_receipts(received_at, id);
+        CREATE INDEX IF NOT EXISTS idx_invoices_date_status
+          ON invoices(invoice_date, status);
+        CREATE INDEX IF NOT EXISTS idx_payments_date_status
+          ON payments(payment_date, status);
+        CREATE INDEX IF NOT EXISTS idx_sales_returns_date_status
+          ON sales_returns(return_date, status);
+        CREATE INDEX IF NOT EXISTS idx_refunds_created_status
+          ON refunds(created_at, status);
+        CREATE INDEX IF NOT EXISTS idx_refunds_completed_status
+          ON refunds(completed_at, status);
+      `);
+    },
+  },
 ];
 
 function ensureTableMigrations(db) {
@@ -557,7 +579,24 @@ function maybeBackupDatabase(filename) {
   return backupPath;
 }
 
-export function createDatabase(filename = process.env.DATABASE_PATH || path.join(process.cwd(), 'data', 'stockpilot.db')) {
+export function createDatabase(
+  filename = process.env.DATABASE_PATH || path.join(process.cwd(), 'data', 'stockpilot.db'),
+  {
+    allowCreate = process.env.NODE_ENV !== 'production',
+    seed = process.env.NODE_ENV !== 'production',
+  } = {},
+) {
+  const isProduction = process.env.NODE_ENV === 'production';
+  if (isProduction && !process.env.DATABASE_PATH) {
+    throw new Error('Production startup requires an explicit DATABASE_PATH pointing to persistent storage.');
+  }
+  if (isProduction && filename === ':memory:') {
+    throw new Error('Production startup cannot use an in-memory SQLite database.');
+  }
+  if (!allowCreate && (!fs.existsSync(filename) || fs.statSync(filename).size === 0)) {
+    throw new Error(`SQLite database does not exist or is empty: ${filename}. Provision it with npm run db:migrate first.`);
+  }
+
   if (filename !== ':memory:') {
     fs.mkdirSync(path.dirname(path.resolve(filename)), { recursive: true });
   }
@@ -588,9 +627,9 @@ export function createDatabase(filename = process.env.DATABASE_PATH || path.join
     }
   }
 
-  if (filename !== ':memory:') {
-    const seed = db.transaction(() => seedDeterministicData(db));
-    seed();
+  if (filename !== ':memory:' && seed) {
+    const seedDatabase = db.transaction(() => seedDeterministicData(db));
+    seedDatabase();
   }
   return db;
 }

@@ -8,11 +8,14 @@ coverage/
 .env.*
 !.env.example
 
-# SQLite databases and backups
-data/*.db
-data/*.db-*
+# SQLite databases, sidecars, and backups
+data/
+*.db
+*.db-*
 *.sqlite
 *.sqlite3
+*.sqlite-*
+*.bak-*
 
 # Logs
 *.log
@@ -21,10 +24,4 @@ npm-debug.log*
 # Editor and OS files
 .vscode/
 .DS_Store
-Thumbs.dbnode_modules/
-dist/
-data/
-.env
-.env.*
-!.env.example
-npm-debug.log*
+Thumbs.db
